@@ -1,0 +1,38 @@
+{
+  "wake_word": "hej_zgredek",
+  "version": "2.0.0",
+  "model": "hej_zgredek.tflite",
+  "author": "lukcz",
+  "website": "https://github.com/lukcz/ha-wakeword-trainer",
+  "description": "Polish wake word 'Hej Zgredek' for Home Assistant Voice PE",
+  "language": "pl",
+  "trained_languages": ["pl-PL"],
+  "micro_wake_word": {
+    "probability_cutoff": 0.75,
+    "sliding_window_size": 5
+  },
+  "training_info": {
+    "samples": 3906,
+    "steps": 15000,
+    "final_accuracy": 0.9994,
+    "final_recall": 0.9961,
+    "final_precision": 0.9955,
+    "validation_recall": 0.9765,
+    "validation_precision": 1.0,
+    "estimated_false_positives_per_hour": 4.24
+  },
+  "suggested_cutoffs": {
+    "conservative": {
+      "probability_cutoff": 0.85,
+      "description": "Fewer false activations, may miss some wake words"
+    },
+    "balanced": {
+      "probability_cutoff": 0.75,
+      "description": "Good balance between detection and false positives"
+    },
+    "sensitive": {
+      "probability_cutoff": 0.60,
+      "description": "Catches more wake words, may have more false activations"
+    }
+  }
+}
