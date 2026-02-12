@@ -311,30 +311,46 @@ def download_audioset(output_dir):
     audioset_dir.mkdir(parents=True, exist_ok=True)
     
     tar_path = audioset_raw / "bal_train09.tar"
-    if not tar_path.exists():
-        print(f"    ↓ AudioSet (background sounds)...")
-        url = "https://huggingface.co/datasets/agkphysics/AudioSet/resolve/main/data/bal_train09.tar"
-        download_file(url, str(tar_path), "    AudioSet")
     
-    # Extract
-    print(f"    Extracting...")
-    import tarfile
-    with tarfile.open(tar_path, 'r') as tar:
-        tar.extractall(audioset_raw)
+    try:
+        import tarfile
+        
+        if not tar_path.exists() or tar_path.stat().st_size < 1000000:  # < 1MB = probably failed
+            if tar_path.exists():
+                tar_path.unlink()  # Remove corrupted file
+            print(f"    ↓ AudioSet (background sounds)...")
+            url = "https://huggingface.co/datasets/agkphysics/AudioSet/resolve/main/data/bal_train09.tar"
+            download_file(url, str(tar_path), "    AudioSet")
+        
+        # Verify file is valid tar
+        if not tarfile.is_tarfile(str(tar_path)):
+            print(f"    ⚠ AudioSet download corrupted, skipping (training will still work)")
+            if tar_path.exists():
+                tar_path.unlink()
+            return
+        
+        # Extract
+        print(f"    Extracting...")
+        with tarfile.open(tar_path, 'r') as tar:
+            tar.extractall(audioset_raw)
+        
+        # Convert to 16kHz
+        print(f"    Converting to 16kHz...")
+        flac_files = list((audioset_raw / "audio").glob("*.flac"))
+        
+        for flac_file in tqdm(flac_files, desc="    Converting"):
+            wav_file = audioset_dir / f"{flac_file.stem}.wav"
+            subprocess.run([
+                "ffmpeg", "-i", str(flac_file),
+                "-ar", "16000", "-ac", "1",
+                str(wav_file), "-y", "-loglevel", "error"
+            ], capture_output=True)
+        
+        print(f"    ✓ AudioSet ready ({len(list(audioset_dir.glob('*.wav')))} files)")
     
-    # Convert to 16kHz
-    print(f"    Converting to 16kHz...")
-    flac_files = list((audioset_raw / "audio").glob("*.flac"))
-    
-    for flac_file in tqdm(flac_files, desc="    Converting"):
-        wav_file = audioset_dir / f"{flac_file.stem}.wav"
-        subprocess.run([
-            "ffmpeg", "-i", str(flac_file),
-            "-ar", "16000", "-ac", "1",
-            str(wav_file), "-y", "-loglevel", "error"
-        ], capture_output=True)
-    
-    print(f"    ✓ AudioSet ready ({len(list(audioset_dir.glob('*.wav')))} files)")
+    except Exception as e:
+        print(f"    ⚠ AudioSet failed: {e}")
+        print(f"    Skipping AudioSet (training will still work without it)")
 
 
 # =============================================================================
