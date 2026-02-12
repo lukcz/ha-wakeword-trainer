@@ -226,27 +226,180 @@ python train_wakeword.py "Wake Word Two" --data_dir ./training1 --output_dir ./t
 
 ## Deploying to ESPHome
 
-### 1. Upload to GitHub Releases
+After training completes, you'll have two files:
+- `your_wake_word.tflite` — The model (~100KB)
+- `your_wake_word.json` — Manifest for ESPHome
 
-Create a new release on your GitHub repo and upload both files:
-- `your_wake_word.tflite`
-- `your_wake_word.json`
+### Step 1: Create a GitHub Repository
 
-### 2. Update ESPHome Config
+If you don't have one yet:
+
+```bash
+# Install GitHub CLI (if not installed)
+sudo apt install gh
+
+# Login to GitHub
+gh auth login
+
+# Create a new repo
+gh repo create my-wake-word --public --description "Custom wake word model"
+
+# Clone it
+git clone https://github.com/YOUR_USERNAME/my-wake-word
+cd my-wake-word
+```
+
+### Step 2: Upload Files to GitHub Releases
+
+**Option A: Using GitHub Web Interface (Easiest)**
+
+1. Go to your repo: `https://github.com/YOUR_USERNAME/my-wake-word`
+2. Click **"Releases"** (right sidebar)
+3. Click **"Create a new release"**
+4. Fill in:
+   - **Tag**: `v1.0.0`
+   - **Title**: `Wake Word Model v1.0.0`
+   - **Description**: Your wake word name and settings
+5. **Drag and drop** both `.tflite` and `.json` files into the "Attach binaries" area
+6. Click **"Publish release"**
+
+**Option B: Using GitHub CLI**
+
+```bash
+cd ~/wakeword_training
+
+# Create a release with both files
+gh release create v1.0.0 \
+    --repo YOUR_USERNAME/my-wake-word \
+    --title "Wake Word Model v1.0.0" \
+    --notes "Custom wake word: Hey Jarvis" \
+    hey_jarvis.tflite \
+    hey_jarvis.json
+```
+
+**Option C: Using Git + Web Upload**
+
+```bash
+cd my-wake-word
+
+# Copy files
+cp ~/wakeword_training/hey_jarvis.* .
+
+# Commit to repo (optional, for backup)
+git add .
+git commit -m "Add wake word model"
+git push
+
+# Then create release via web interface and upload files
+```
+
+### Step 3: Get the Raw URL
+
+After creating the release, your files will be available at:
+```
+https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.json
+https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.tflite
+```
+
+The JSON manifest should point to the tflite file. Edit `hey_jarvis.json` before uploading:
+
+```json
+{
+  "version": 2,
+  "wake_word": "hey jarvis",
+  "author": "your_name",
+  "model": "https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.tflite",
+  "micro": {
+    "probability_cutoff": 0.7,
+    "sliding_window_size": 5
+  }
+}
+```
+
+**Important**: The `model` field in JSON must contain the **full URL** to the `.tflite` file!
+
+### Step 4: Update ESPHome Config
+
+Edit your Voice PE YAML file (e.g., `voice-pe.yaml`):
 
 ```yaml
 micro_wake_word:
   models:
-    - model: https://github.com/YOUR_USER/your-repo/releases/download/v1.0.0/your_wake_word.json
+    # Your custom wake word
+    - model: https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.json
       probability_cutoff: 0.7
       sliding_window_size: 5
-    - model: okay_nabu  # Backup wake word (optional)
+    
+    # Backup wake word (optional but recommended)
+    - model: okay_nabu
 ```
 
-### 3. Flash and Test
+**Configuration Options:**
+
+| Option | Description | Recommended |
+|--------|-------------|-------------|
+| `probability_cutoff` | Detection threshold (0.0-1.0) | Start with 0.7 |
+| `sliding_window_size` | Consecutive detections needed | 5 (default) |
+
+### Step 5: Flash Your Device
 
 ```bash
-esphome run your-voice-pe.yaml
+# Using ESPHome CLI
+esphome run voice-pe.yaml
+
+# Or via Home Assistant ESPHome add-on
+# Go to ESPHome Dashboard → Your Device → Install
+```
+
+### Step 6: Test and Tune
+
+1. **Say your wake word** clearly from 1-2 meters
+2. **Check logs** for detection events:
+   ```bash
+   esphome logs voice-pe.yaml
+   ```
+
+**Tuning Tips:**
+
+| Problem | Solution |
+|---------|----------|
+| Not responding | Lower `probability_cutoff` to 0.5-0.6 |
+| Too many false triggers | Raise `probability_cutoff` to 0.8-0.9 |
+| Inconsistent detection | Increase `sliding_window_size` to 7-10 |
+| Works close but not far | Retrain with more variations |
+
+### Complete Example
+
+Here's a complete Voice PE config with custom wake word:
+
+```yaml
+esphome:
+  name: voice-assistant
+  friendly_name: Voice Assistant
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# ... (other config like wifi, api, etc.)
+
+micro_wake_word:
+  models:
+    - model: https://github.com/lukcz/zgredek-wakeword/releases/download/v1.0.0/hej_zgredek.json
+      probability_cutoff: 0.7
+      sliding_window_size: 5
+  on_wake_word_detected:
+    - light.turn_on:
+        id: led_ring
+        effect: "Listening"
+    - voice_assistant.start:
+
+voice_assistant:
+  microphone: mic
+  speaker: speaker
+  on_end:
+    - light.turn_off: led_ring
 ```
 
 ## Troubleshooting
