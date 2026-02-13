@@ -37,10 +37,12 @@ You should see your GPU listed. If not, update your NVIDIA Windows driver to the
 ### Option A: One-liner
 
 ```bash
-# From PowerShell (Windows):
+# From PowerShell (Windows) — cd to the repo first:
+cd path\to\openwakeword-trainer
 wsl -- bash train.sh
 
 # Or from within WSL2/Linux:
+cd /mnt/c/path/to/openwakeword-trainer
 bash train.sh
 ```
 
@@ -90,7 +92,7 @@ python train_wakeword.py --from augment
    python train_wakeword.py --config configs/my_word.yaml
    ```
 
-4. Find your model in `export/my_word.onnx`.
+4. Find your model in `export/my_word.onnx` (and `export/my_word.onnx.data`).
 
 ## Pipeline Steps
 
@@ -142,7 +144,12 @@ python train_wakeword.py --list-steps
 
 ## Using Your Model
 
-The trained model works with any openWakeWord-compatible runtime:
+The export step produces two files that must be kept together:
+
+- `hey_echo.onnx` — the model graph (~14 KB)
+- `hey_echo.onnx.data` — external weights (~200 KB)
+
+Copy **both** files to your project. The trained model works with any openWakeWord-compatible runtime:
 
 ```python
 from openwakeword.model import Model

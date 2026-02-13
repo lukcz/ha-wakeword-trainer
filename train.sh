@@ -52,9 +52,6 @@ pip install 'setuptools<82' -q
 
 pip install -r "$SCRIPT_DIR/requirements.txt" -q
 
-# Ensure soundfile is available for patched torchaudio fallback
-pip install soundfile -q
-
 # ── Run the training script ──
 # All CLI flags (--step, --from, --verify-only, --list-steps, --config) are
 # forwarded transparently via "$@".

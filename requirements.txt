@@ -5,6 +5,7 @@
 # --- Core training ---
 openwakeword
 torch>=2.0
+torchaudio>=2.0
 torchinfo>=1.8
 torchmetrics>=1.2
 speechbrain>=0.5.14

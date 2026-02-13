@@ -1,7 +1,7 @@
 # ── Training artifacts (generated, large) ──
 output/
 data/
-*.npy
+export/
 
 # ── Virtual environments ──
 .venv*/
