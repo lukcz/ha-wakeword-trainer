@@ -102,8 +102,10 @@ EXAMPLES:
                         help="Skip downloading datasets (use existing)")
     parser.add_argument("--samples_dir", default=None,
                         help="Use existing 16kHz WAV samples from this directory (skips TTS generation)")
-    parser.add_argument("--cpu_only", action="store_true", default=True,
-                        help="Force CPU training (default: True, GPU often has issues)")
+    parser.add_argument("--cpu_only", action="store_true", default=False,
+                        help="Force CPU training (default: False, uses GPU if available)")
+    parser.add_argument("--gpu", action="store_true", default=False,
+                        help="Force GPU training (explicitly enable CUDA)")
     return parser.parse_args()
 
 
@@ -521,7 +523,7 @@ def patch_train_py():
         print(f"  ⚠ Could not patch train.py: {e}")
 
 
-def run_training(config_path, cpu_only=True):
+def run_training(config_path, cpu_only=False):
     """Run the training process"""
     cmd = [
         sys.executable, "-m", "microwakeword.model_train_eval",
@@ -543,14 +545,25 @@ def run_training(config_path, cpu_only=True):
     env = os.environ.copy()
     if cpu_only:
         env["CUDA_VISIBLE_DEVICES"] = "-1"
+        print("\n  🖥️  Training on CPU...")
+    else:
+        # Auto-detect GPU
+        try:
+            import tensorflow as tf
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                print(f"\n  🚀 Training on GPU: {gpus[0].name}")
+            else:
+                print("\n  🖥️  No GPU detected, training on CPU...")
+        except Exception:
+            print("\n  🖥️  Training (GPU detection failed, using default)...")
     
-    print("\n  Training started! This will take 10-30 minutes...")
     print("  Progress is shown every 500 steps.\n")
     
     subprocess.run(cmd, env=env, check=True)
 
 
-def run_conversion(config_path, cpu_only=True):
+def run_conversion(config_path, cpu_only=False):
     """Run model conversion if tflite wasn't generated during training"""
     cmd = [
         sys.executable, "-m", "microwakeword.model_train_eval",
