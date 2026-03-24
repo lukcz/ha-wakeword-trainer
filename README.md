@@ -67,7 +67,7 @@ source ~/wakeword-env/bin/activate
 pip install --upgrade pip wheel setuptools
 pip install 'numpy>=1.24.0,<2.0'
 pip install 'pyarrow>=12.0.0,<15.0.0'
-pip install tensorflow==2.15.1  # 2.16+ removes tensorflow.lite.experimental
+pip install tensorflow==2.16.1
 pip install datasets==2.14.0
 pip install edge-tts soundfile librosa scipy pyyaml requests tqdm mmap-ninja webrtcvad
 
@@ -99,11 +99,7 @@ Native Windows is **not supported** due to TensorFlow limitations. Use WSL2:
 
 #### `ModuleNotFoundError: No module named 'tensorflow.lite.experimental'`
 **Cause:** TensorFlow 2.16+ removed the `tensorflow.lite.experimental.microfrontend` module.
-**Fix:** Use TensorFlow 2.15.1 instead:
-```bash
-pip uninstall tensorflow
-pip install tensorflow==2.15.1
-```
+**Fix:** If using manual setup, apply the patch to micro-wake-word or use the provided `setup_environment.sh` which handles this automatically.
 
 #### FFmpeg not found (Windows)
 **Cause:** FFmpeg is not installed or not in PATH.

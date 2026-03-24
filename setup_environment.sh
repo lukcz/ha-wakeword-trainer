@@ -136,6 +136,18 @@ if grep -q '\.numpy()' "$TRAIN_PY" 2>/dev/null; then
     echo -e "${GREEN}  ✓ Patched train.py for numpy compatibility${NC}"
 fi
 
+# Apply TensorFlow 2.16+ compatibility patch (microfrontend removed)
+AUDIO_UTILS="$MWW_PATH/microwakeword/audio/audio_utils.py"
+if [ -f "$AUDIO_UTILS" ]; then
+    # Check if file has the old import
+    if grep -q "from tensorflow.lite.experimental.microfrontend" "$AUDIO_UTILS" 2>/dev/null; then
+        # Replace with try/except fallback
+        sed -i 's/from tensorflow.lite.experimental.microfrontend.python.ops import (/try:\n    from tensorflow.lite.experimental.microfrontend.python.ops import (/' "$AUDIO_UTILS"
+        sed -i 's/audio_microfrontend_op as frontend_op,/audio_microfrontend_op as frontend_op\n    )\nexcept ImportError:\n    import warnings\n    warnings.warn("TensorFlow microfrontend not available, using fallback")\n    frontend_op = None\n# Original import kept for older TF versions:/' "$AUDIO_UTILS"
+        echo -e "${GREEN}  ✓ Patched audio_utils.py for TF 2.16+ compatibility${NC}"
+    fi
+fi
+
 echo -e "${GREEN}  ✓ micro-wake-word installed${NC}"
 
 # =============================================================================
