@@ -67,7 +67,7 @@ source ~/wakeword-env/bin/activate
 pip install --upgrade pip wheel setuptools
 pip install 'numpy>=1.24.0,<2.0'
 pip install 'pyarrow>=12.0.0,<15.0.0'
-pip install tensorflow==2.16.1
+pip install tensorflow==2.15.1  # 2.16+ removes tensorflow.lite.experimental
 pip install datasets==2.14.0
 pip install edge-tts soundfile librosa scipy pyyaml requests tqdm mmap-ninja webrtcvad
 
@@ -94,6 +94,24 @@ pip install -r https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/
 ### Windows Users (WSL2 Required)
 
 Native Windows is **not supported** due to TensorFlow limitations. Use WSL2:
+
+### Common Issues
+
+#### `ModuleNotFoundError: No module named 'tensorflow.lite.experimental'`
+**Cause:** TensorFlow 2.16+ removed the `tensorflow.lite.experimental.microfrontend` module.
+**Fix:** Use TensorFlow 2.15.1 instead:
+```bash
+pip uninstall tensorflow
+pip install tensorflow==2.15.1
+```
+
+#### FFmpeg not found (Windows)
+**Cause:** FFmpeg is not installed or not in PATH.
+**Fix:** Download from https://www.gyan.dev/ffmpeg/builds/ and add `bin/` folder to PATH.
+
+#### MUSAN download rate limited
+**Cause:** HuggingFace rate limiting.
+**Fix:** Training will continue without MUSAN (optional dataset). For best results, wait 1-2 hours and retry, or create a HuggingFace account and set `HF_TOKEN`.
 
 ```powershell
 # In PowerShell (Admin)
