@@ -48,6 +48,87 @@ bash train.sh
 
 This creates an isolated virtualenv, installs dependencies, downloads datasets, trains the model, and exports the result.
 
+### Option A2: Download-and-run with wget
+
+If you don't want to clone the repo first, you can grab the setup script directly:
+
+```bash
+wget https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/setup_environment.sh
+chmod +x setup_environment.sh
+./setup_environment.sh
+```
+
+After setup finishes:
+
+```bash
+source ~/wakeword-env/bin/activate
+python ~/train_wakeword.py
+```
+
+### Option A2: Download-and-run with wget
+
+If you don't want to clone the repo first, you can grab the setup script directly:
+
+```bash
+wget https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/setup_environment.sh
+chmod +x setup_environment.sh
+./setup_environment.sh
+```
+
+After setup finishes:
+
+```bash
+source ~/wakeword-env/bin/activate
+python ~/train_wakeword.py
+```
+
+### Manual Setup (classic trainer path)
+
+If you prefer to set things up manually inside WSL2/Linux:
+
+```bash
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv ffmpeg git wget
+python3 -m venv ~/wakeword-env
+source ~/wakeword-env/bin/activate
+pip install --upgrade pip wheel setuptools
+pip install -r requirements.txt
+python train_wakeword.py
+```
+
+### Using requirements.txt directly
+
+If you already created a virtual environment, you can install dependencies with:
+
+```bash
+source ~/wakeword-env/bin/activate
+pip install -r requirements.txt
+```
+
+### Windows Users (WSL2 Required)
+
+Native Windows is still not the recommended path for training. Use WSL2:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Then continue from inside WSL.
+
+### Common Issues
+
+#### Missing FFmpeg
+Install it in WSL2/Linux:
+
+```bash
+sudo apt install -y ffmpeg
+```
+
+#### MUSAN download rate limits / failures
+This can happen from upstream mirrors. Retry later, or continue with the datasets you already have. For best results, provide as many ambient / non-speech datasets as possible.
+
+#### GPU issues on newer cards
+If CUDA/TensorFlow/OpenWakeWord gets weird, fall back to CPU first and verify the pipeline works end-to-end before debugging GPU.
+
 ### Option B: Step-by-step
 
 ```bash
@@ -115,6 +196,7 @@ Notes:
 - Negative datasets should contain **non-speech / ambience / music**.
 - In VAD mode the script skips Piper clip synthesis and instead prepares `positive_train`, `positive_test`, `negative_train`, and `negative_test` directly from the selected datasets.
 - Export also writes an ESPHome-style VAD manifest JSON with `wake_word: "vad"`. The repo still trains/export ONNX, so a later ONNX→TFLite conversion step is still needed for direct ESPHome deployment.
+- This VAD workflow is intended as a practical training/orchestration path in this repo; final ESPHome deployment still needs the model packaging/conversion step.
 
 ## Pipeline Steps
 
