@@ -4,7 +4,7 @@ Train custom wake word models with [openWakeWord](https://github.com/dscripka/op
 
 ## What It Does
 
-This toolkit automates the entire openWakeWord training process:
+This toolkit automates the entire openWakeWord training process. It now also supports a practical **VAD mode** for training a Polish speech-vs-non-speech classifier from datasets selected in the CLI/script.
 
 1. **Synthesizes** thousands of speech clips using Piper TTS with varied voices and accents
 2. **Augments** clips with real-world noise, music, and room impulse responses
@@ -94,6 +94,28 @@ python train_wakeword.py --from augment
 
 4. Find your model in `export/my_word.onnx` (and `export/my_word.onnx.data`).
 
+### Train a Polish VAD model from datasets
+
+Use `configs/polish_vad.yaml` when you want **speech vs non-speech** instead of a phrase detector.
+
+```bash
+python train_wakeword.py \
+  --config configs/polish_vad.yaml \
+  --mode vad \
+  --positive-datasets mc_speech,bigos \
+  --negative-datasets no_speech,dinner_party,musan,fma \
+  --dataset-path mc_speech=/data/polish/mc_speech \
+  --dataset-path bigos=/data/polish/bigos \
+  --dataset-path no_speech=/data/no_speech \
+  --dataset-path dinner_party=/data/dinner_party
+```
+
+Notes:
+- Positive datasets should contain **real speech clips** (Polish speech, multiple speakers).
+- Negative datasets should contain **non-speech / ambience / music**.
+- In VAD mode the script skips Piper clip synthesis and instead prepares `positive_train`, `positive_test`, `negative_train`, and `negative_test` directly from the selected datasets.
+- Export also writes an ESPHome-style VAD manifest JSON with `wake_word: "vad"`. The repo still trains/export ONNX, so a later ONNX→TFLite conversion step is still needed for direct ESPHome deployment.
+
 ## Pipeline Steps
 
 The pipeline runs **13 granular steps**, each with built-in verification. If any step fails, it stops immediately and tells you exactly how to resume.
@@ -140,6 +162,12 @@ python train_wakeword.py --verify-only
 
 # Show all available steps
 python train_wakeword.py --list-steps
+
+# VAD mode with dataset selection overrides
+python train_wakeword.py --config configs/polish_vad.yaml --mode vad \
+  --positive-datasets mc_speech,bigos \
+  --negative-datasets no_speech,dinner_party,musan,fma \
+  --dataset-path mc_speech=/abs/path/to/mc_speech
 ```
 
 ## Using Your Model

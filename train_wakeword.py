@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import logging
 import os
 import shutil
@@ -69,6 +70,57 @@ MIN_SIZES = {
     "openwakeword_features_ACAV100M_2000_hrs_16bit.npy": 5_000_000_000,   # ~7.5 GB
     "validation_set_features.npy":                         30_000_000,      # ~40 MB
     "piper-sample-generator/models/en_US-libritts_r-medium.pt": 600_000_000,  # ~800 MB
+}
+
+DATASET_REGISTRY = {
+    "mc_speech": {
+        "kind": "positive",
+        "default_path": DATA_DIR / "mc_speech",
+        "description": "Polish speech clips (MC Speech, user-supplied)",
+        "placeholder": True,
+    },
+    "bigos": {
+        "kind": "positive",
+        "default_path": DATA_DIR / "bigos",
+        "description": "Polish speech clips (BIGOS, user-supplied)",
+        "placeholder": True,
+    },
+    "pl_speech": {
+        "kind": "positive",
+        "default_path": DATA_DIR / "pl_speech",
+        "description": "Additional Polish speech clips (user-supplied)",
+        "placeholder": True,
+    },
+    "no_speech": {
+        "kind": "negative",
+        "default_path": DATA_DIR / "no_speech",
+        "description": "Silence / HVAC / room tone negatives",
+        "placeholder": True,
+    },
+    "dinner_party": {
+        "kind": "negative",
+        "default_path": DATA_DIR / "dinner_party",
+        "description": "Crowd / babble / kitchen ambience negatives",
+        "placeholder": True,
+    },
+    "musan": {
+        "kind": "negative",
+        "default_path": DATA_DIR / "musan",
+        "description": "MUSAN music/noise/speech negatives",
+        "placeholder": False,
+    },
+    "fma": {
+        "kind": "negative",
+        "default_path": DATA_DIR / "fma_small",
+        "description": "FMA music negatives",
+        "placeholder": False,
+    },
+    "audioset": {
+        "kind": "negative",
+        "default_path": DATA_DIR / "audioset_16k",
+        "description": "AudioSet background negatives",
+        "placeholder": False,
+    },
 }
 
 logging.basicConfig(
@@ -123,6 +175,63 @@ def _clone_repo(url: str, dest: Path) -> None:
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     _run(["git", "clone", "--depth", "1", url, str(dest)])
+
+
+def _load_config(path: Path | None = None) -> dict:
+    with open(path or CONFIG_FILE) as f:
+        return yaml.safe_load(f)
+
+
+def _dataset_overrides_from_env() -> dict[str, str]:
+    raw = os.environ.get("OWW_DATASET_PATHS", "").strip()
+    overrides = {}
+    if not raw:
+        return overrides
+    for item in raw.split(","):
+        if not item or "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        overrides[name.strip()] = value.strip()
+    return overrides
+
+
+def _get_mode(cfg: dict) -> str:
+    return str(cfg.get("mode") or cfg.get("training_type") or "wakeword").lower()
+
+
+def _get_dataset_names(cfg: dict, kind: str) -> list[str]:
+    datasets = cfg.get("datasets", {}) or {}
+    names = datasets.get(kind, []) or []
+    if isinstance(names, str):
+        names = [n.strip() for n in names.split(",") if n.strip()]
+    return [str(n).strip() for n in names if str(n).strip()]
+
+
+def _resolve_dataset_paths(cfg: dict, kind: str) -> list[tuple[str, Path]]:
+    overrides = {**(cfg.get("dataset_paths", {}) or {}), **_dataset_overrides_from_env()}
+    resolved = []
+    for name in _get_dataset_names(cfg, kind):
+        meta = DATASET_REGISTRY.get(name, {})
+        raw_path = overrides.get(name)
+        if raw_path:
+            path = Path(raw_path).expanduser()
+        else:
+            path = meta.get("default_path", DATA_DIR / name)
+        if not path.is_absolute():
+            path = (SCRIPT_DIR / path).resolve()
+        resolved.append((name, path))
+    return resolved
+
+
+def _ensure_placeholder_dataset(name: str, path: Path, description: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    readme = path / "README.txt"
+    if not readme.exists():
+        readme.write_text(
+            f"Placeholder dataset: {name}\n\n{description}\n\n"
+            "Put .wav/.flac/.mp3 files here or pass --dataset-path name=/abs/path.\n",
+            encoding="utf-8",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -212,25 +321,30 @@ def step_apply_patches() -> bool:
 def step_download() -> bool:
     """Download all datasets, tools, and models.  Idempotent."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = _load_config()
+    mode = _get_mode(cfg)
 
-    # 3a — Piper Sample Generator repo
+    # 3a — Piper Sample Generator repo (wake word mode only)
     piper_dir = DATA_DIR / "piper-sample-generator"
-    _clone_repo(URLS["piper_repo"], piper_dir)
+    if mode != "vad":
+        _clone_repo(URLS["piper_repo"], piper_dir)
 
-    piper_marker = piper_dir / ".installed"
-    if not piper_marker.exists():
-        log.info("  Installing piper-sample-generator (editable) …")
-        _run([sys.executable, "-m", "pip", "install", "-e", "."], cwd=piper_dir)
-        piper_marker.touch()
+        piper_marker = piper_dir / ".installed"
+        if not piper_marker.exists():
+            log.info("  Installing piper-sample-generator (editable) …")
+            _run([sys.executable, "-m", "pip", "install", "-e", "."], cwd=piper_dir)
+            piper_marker.touch()
 
-    # 3b — Piper TTS model
-    piper_models_dir = piper_dir / "models"
-    piper_models_dir.mkdir(exist_ok=True)
-    _download(
-        URLS["piper_model"],
-        piper_models_dir / "en_US-libritts_r-medium.pt",
-        "Piper LibriTTS model (~800 MB)",
-    )
+        # 3b — Piper TTS model
+        piper_models_dir = piper_dir / "models"
+        piper_models_dir.mkdir(exist_ok=True)
+        _download(
+            URLS["piper_model"],
+            piper_models_dir / "en_US-libritts_r-medium.pt",
+            "Piper LibriTTS model (~800 MB)",
+        )
+    else:
+        log.info("  VAD mode: skipping Piper download (positives come from datasets)")
 
     # 3c — ACAV100M pre-computed negative features
     _download(
@@ -253,18 +367,33 @@ def step_download() -> bool:
     else:
         log.info("  MIT RIRs already present")
 
-    # 3f — Background noise
-    audioset_dir = DATA_DIR / "audioset_16k"
-    if not audioset_dir.exists():
-        _download_audioset_subset(audioset_dir)
-    else:
-        log.info("  AudioSet subset already present")
+    selected_negative = set(_get_dataset_names(cfg, "negative"))
+    if not selected_negative or "audioset" in selected_negative:
+        audioset_dir = DATA_DIR / "audioset_16k"
+        if not audioset_dir.exists():
+            _download_audioset_subset(audioset_dir)
+        else:
+            log.info("  AudioSet subset already present")
 
-    fma_dir = DATA_DIR / "fma_small"
-    if not fma_dir.exists():
-        _download_fma_subset(fma_dir)
-    else:
-        log.info("  FMA subset already present")
+    if not selected_negative or "fma" in selected_negative:
+        fma_dir = DATA_DIR / "fma_small"
+        if not fma_dir.exists():
+            _download_fma_subset(fma_dir)
+        else:
+            log.info("  FMA subset already present")
+
+    if "musan" in selected_negative:
+        musan_dir = DATA_DIR / "musan"
+        if not musan_dir.exists():
+            _download_musan_subset(musan_dir)
+        else:
+            log.info("  MUSAN subset already present")
+
+    for kind in ("positive", "negative"):
+        for name, path in _resolve_dataset_paths(cfg, kind):
+            meta = DATASET_REGISTRY.get(name, {})
+            if meta.get("placeholder"):
+                _ensure_placeholder_dataset(name, path, meta.get("description", name))
 
     return True
 
@@ -274,9 +403,13 @@ def step_download() -> bool:
 def step_verify_data() -> bool:
     """Check every expected download exists with minimum file sizes."""
     ok = True
+    cfg = _load_config()
+    mode = _get_mode(cfg)
 
     # Large feature / model files
     for relpath, min_bytes in MIN_SIZES.items():
+        if mode == "vad" and relpath.endswith("en_US-libritts_r-medium.pt"):
+            continue
         fp = DATA_DIR / relpath
         if not fp.exists():
             log.error("  MISSING: %s", fp)
@@ -307,11 +440,22 @@ def step_verify_data() -> bool:
 
     # Piper install marker
     marker = DATA_DIR / "piper-sample-generator" / ".installed"
-    if not marker.exists():
-        log.error("  Piper not installed (run download step)")
-        ok = False
+    if mode != "vad":
+        if not marker.exists():
+            log.error("  Piper not installed (run download step)")
+            ok = False
+        else:
+            log.info("  OK: piper-sample-generator installed")
     else:
-        log.info("  OK: piper-sample-generator installed")
+        log.info("  VAD mode: Piper install not required")
+
+    for kind in ("positive", "negative"):
+        for name, path in _resolve_dataset_paths(cfg, kind):
+            if path.exists():
+                n = len(list(path.rglob("*")))
+                log.info("  Dataset %-18s %s  (%d filesystem entries)", name, path, n)
+            else:
+                log.warning("  Dataset %-18s missing at %s", name, path)
 
     return ok
 
@@ -320,12 +464,14 @@ def step_verify_data() -> bool:
 
 def step_resolve_config() -> bool:
     """Read config YAML, resolve relative paths → absolute, write output."""
-    with open(CONFIG_FILE) as f:
-        cfg = yaml.safe_load(f)
+    cfg = _load_config()
+    mode = _get_mode(cfg)
+    cfg["mode"] = mode
 
-    cfg["piper_sample_generator_path"] = str(
-        (SCRIPT_DIR / cfg["piper_sample_generator_path"]).resolve()
-    )
+    if "piper_sample_generator_path" in cfg:
+        cfg["piper_sample_generator_path"] = str(
+            (SCRIPT_DIR / cfg["piper_sample_generator_path"]).resolve()
+        )
     cfg["output_dir"] = str((SCRIPT_DIR / cfg["output_dir"]).resolve())
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
@@ -344,6 +490,19 @@ def step_resolve_config() -> bool:
         cfg["false_positive_validation_data_path"] = str(
             (SCRIPT_DIR / cfg["false_positive_validation_data_path"]).resolve()
         )
+
+    dataset_paths = {}
+    for kind in ("positive", "negative"):
+        dataset_paths[kind] = {name: str(path) for name, path in _resolve_dataset_paths(cfg, kind)}
+    cfg["resolved_dataset_paths"] = dataset_paths
+
+    export_manifest = cfg.get("export_manifest", {}) or {}
+    if mode == "vad":
+        export_manifest.setdefault("esphome_vad", True)
+        export_manifest.setdefault("wake_word", "vad")
+        export_manifest.setdefault("trained_languages", ["pl"])
+        export_manifest.setdefault("author", "ha-wakeword-trainer")
+    cfg["export_manifest"] = export_manifest
 
     RESOLVED_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     with open(RESOLVED_CONFIG, "w") as f:
@@ -366,11 +525,95 @@ def step_resolve_config() -> bool:
 
 # ── 6. generate ──────────────────────────────────────────────────────────
 
+def _iter_audio_files(root: Path) -> list[Path]:
+    exts = {'.wav', '.flac', '.mp3', '.ogg', '.m4a'}
+    return [p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in exts]
+
+
+def _resample_audio_file(src: Path, dest: Path) -> None:
+    import numpy as np
+    import soundfile as sf
+    from scipy import signal
+
+    data, sr = sf.read(str(src), always_2d=False)
+    if hasattr(data, 'ndim') and data.ndim > 1:
+        data = data.mean(axis=1)
+    data = np.asarray(data, dtype=np.float32)
+    if sr != 16000 and len(data) > 0:
+        target_len = max(1, round(len(data) * 16000 / sr))
+        data = signal.resample(data, target_len).astype(np.float32)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(dest), data, 16000)
+
+
+def _prepare_vad_training_clips(cfg: dict) -> bool:
+    model_name = cfg.get('model_name', 'vad')
+    model_dir = OUTPUT_DIR / model_name
+    if model_dir.exists():
+        shutil.rmtree(model_dir)
+    splits = {
+        'positive_train': [],
+        'positive_test': [],
+        'negative_train': [],
+        'negative_test': [],
+    }
+
+    pos_limit = int(cfg.get('vad_positive_samples', cfg.get('n_samples', 12000)))
+    neg_limit = int(cfg.get('vad_negative_samples', max(pos_limit, 12000)))
+    val_limit = int(cfg.get('vad_validation_samples', cfg.get('n_samples_val', max(1000, pos_limit // 10))))
+
+    positive_files = []
+    for name, path in _resolve_dataset_paths(cfg, 'positive'):
+        if path.exists():
+            positive_files.extend(_iter_audio_files(path))
+        else:
+            log.warning('  Positive dataset missing: %s -> %s', name, path)
+
+    negative_files = []
+    for name, path in _resolve_dataset_paths(cfg, 'negative'):
+        if path.exists():
+            negative_files.extend(_iter_audio_files(path))
+        else:
+            log.warning('  Negative dataset missing: %s -> %s', name, path)
+
+    if len(positive_files) < 2:
+        log.error('  VAD mode needs real speech audio. Found only %d positive files.', len(positive_files))
+        return False
+    if len(negative_files) < 2:
+        log.error('  VAD mode needs non-speech audio. Found only %d negative files.', len(negative_files))
+        return False
+
+    pos_train = positive_files[:pos_limit]
+    pos_test = positive_files[pos_limit:pos_limit + val_limit] or positive_files[:val_limit]
+    neg_train = negative_files[:neg_limit]
+    neg_test = negative_files[neg_limit:neg_limit + val_limit] or negative_files[:val_limit]
+
+    for split_name, files in {
+        'positive_train': pos_train,
+        'positive_test': pos_test,
+        'negative_train': neg_train,
+        'negative_test': neg_test,
+    }.items():
+        split_dir = model_dir / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for idx, src in enumerate(files):
+            dest = split_dir / f'{split_name}_{idx:05d}.wav'
+            _resample_audio_file(src, dest)
+        log.info('  Prepared %-16s %5d clips', split_name, len(files))
+
+    return True
+
+
 def step_generate() -> bool:
-    """Generate positive + negative clips via Piper TTS."""
+    """Generate positive + negative clips via Piper TTS or prepare VAD datasets."""
     if not RESOLVED_CONFIG.exists():
         log.error("  Resolved config not found — run 'resolve-config' first")
         return False
+
+    cfg = _load_config(RESOLVED_CONFIG)
+    if _get_mode(cfg) == 'vad':
+        log.info('  VAD mode: preparing speech/non-speech clips from datasets …')
+        return _prepare_vad_training_clips(cfg)
 
     log.info("  Generating clips via openwakeword + Piper TTS …")
     log.info("  (Longest step — ~10 min on GPU, hours on CPU)")
@@ -633,10 +876,32 @@ def step_verify_model() -> bool:
 
 # ── 13. export ───────────────────────────────────────────────────────────
 
+def _write_esphome_vad_manifest(cfg: dict, export_dir: Path, model_name: str) -> Path:
+    export_manifest = cfg.get('export_manifest', {}) or {}
+    manifest = {
+        'type': 'micro',
+        'wake_word': export_manifest.get('wake_word', 'vad'),
+        'author': export_manifest.get('author', 'ha-wakeword-trainer'),
+        'website': export_manifest.get('website', 'https://github.com/lgpearson1771/openwakeword-trainer'),
+        'model': export_manifest.get('model', f'{model_name}.tflite'),
+        'trained_languages': export_manifest.get('trained_languages', ['pl']),
+        'version': int(export_manifest.get('version', 2)),
+        'micro': {
+            'probability_cutoff': float(export_manifest.get('probability_cutoff', 0.5)),
+            'tensor_arena_size': int(export_manifest.get('tensor_arena_size', 24000)),
+            'feature_step_size': int(export_manifest.get('feature_step_size', 10)),
+            'sliding_window_size': int(export_manifest.get('sliding_window_size', 5)),
+            'minimum_esphome_version': export_manifest.get('minimum_esphome_version', '2024.7.0'),
+        },
+    }
+    dest = export_dir / f'{model_name}.json'
+    dest.write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+    return dest
+
+
 def step_export() -> bool:
     """Copy the trained model to the export/ directory for easy retrieval."""
-    with open(CONFIG_FILE) as f:
-        cfg = yaml.safe_load(f)
+    cfg = _load_config()
 
     model_name = cfg["model_name"]
     model_path = OUTPUT_DIR / f"{model_name}.onnx"
@@ -663,12 +928,19 @@ def step_export() -> bool:
         shutil.copy2(data_file, dest_data)
         log.info("  External data  → %s", dest_data)
 
+    manifest_dest = None
+    if _get_mode(cfg) == 'vad' or (cfg.get('export_manifest', {}) or {}).get('esphome_vad'):
+        manifest_dest = _write_esphome_vad_manifest(cfg, export_dir, model_name)
+        log.info("  ESPHome VAD manifest → %s", manifest_dest)
+
     log.info("")
     log.info("=" * 60)
     log.info("  DONE!  Your trained model is at:")
     log.info("    %s", dest)
     if data_file.exists():
         log.info("    %s", dest_data)
+    if manifest_dest is not None:
+        log.info("    %s", manifest_dest)
     log.info("")
     log.info("  To use with openWakeWord:")
     log.info("")
@@ -753,6 +1025,33 @@ def _download_fma_subset(dest: Path) -> None:
     except Exception as exc:
         log.warning("  FMA download failed: %s", exc)
         _generate_synthetic_noise(dest, n=100, label="fma")
+
+
+def _download_musan_subset(dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        from datasets import load_dataset
+        import soundfile as sf
+
+        ds = load_dataset("mushanWang/MUSAN", split="train", streaming=True, trust_remote_code=True)
+        count = 0
+        for row in ds:
+            if count >= 300:
+                break
+            try:
+                audio = row.get("audio")
+                if not audio:
+                    continue
+                sf.write(str(dest / f"musan_{count:04d}.wav"), audio["array"], audio["sampling_rate"])
+                count += 1
+            except Exception:
+                continue
+        if count == 0:
+            raise RuntimeError("stream yielded no decodable audio")
+        log.info("  Saved %d MUSAN clips", count)
+    except Exception as exc:
+        log.warning("  MUSAN download failed: %s", exc)
+        _generate_synthetic_noise(dest, n=150, label="musan")
 
 
 def _generate_synthetic_noise(dest: Path, n: int = 200, label: str = "noise") -> None:
@@ -901,6 +1200,22 @@ def main() -> None:
         "--list-steps", action="store_true",
         help="Print all available steps and exit.",
     )
+    parser.add_argument(
+        "--mode", choices=["wakeword", "vad"], default=None,
+        help="Override training mode declared in config.",
+    )
+    parser.add_argument(
+        "--positive-datasets", default=None, metavar="CSV",
+        help="Comma-separated positive dataset names for VAD mode (e.g. mc_speech,bigos).",
+    )
+    parser.add_argument(
+        "--negative-datasets", default=None, metavar="CSV",
+        help="Comma-separated negative dataset names for VAD mode (e.g. no_speech,dinner_party,musan,fma).",
+    )
+    parser.add_argument(
+        "--dataset-path", action="append", default=[], metavar="NAME=PATH",
+        help="Override dataset location. Can be repeated, e.g. --dataset-path mc_speech=/data/mc_speech",
+    )
     args = parser.parse_args()
 
     if args.list_steps:
@@ -919,6 +1234,27 @@ def main() -> None:
             if yamls:
                 CONFIG_FILE = yamls[0]
                 log.info("Using config: %s", CONFIG_FILE)
+
+    if args.mode or args.positive_datasets or args.negative_datasets or args.dataset_path:
+        cfg = _load_config(CONFIG_FILE)
+        if args.mode:
+            cfg['mode'] = args.mode
+        datasets = cfg.setdefault('datasets', {})
+        if args.positive_datasets:
+            datasets['positive'] = [x.strip() for x in args.positive_datasets.split(',') if x.strip()]
+        if args.negative_datasets:
+            datasets['negative'] = [x.strip() for x in args.negative_datasets.split(',') if x.strip()]
+        dataset_paths = cfg.setdefault('dataset_paths', {})
+        for item in args.dataset_path:
+            if '=' not in item:
+                parser.error(f'Invalid --dataset-path value: {item!r}')
+            name, value = item.split('=', 1)
+            dataset_paths[name.strip()] = value.strip()
+        tmp_path = OUTPUT_DIR / '_cli_config.yaml'
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False), encoding='utf-8')
+        CONFIG_FILE = tmp_path
+        log.info('Using CLI-overridden config: %s', CONFIG_FILE)
 
     ok = run_pipeline(
         from_step=args.from_step,
