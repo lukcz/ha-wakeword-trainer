@@ -1,0 +1,83 @@
+# Polish VAD (speech vs non-speech) example configuration
+#
+# Real speech clips go into positive datasets. Non-speech / ambience / music go into
+# negative datasets. You can point each dataset name to a local path via:
+#   python train_wakeword.py --config configs/polish_vad.yaml \
+#     --dataset-path mc_speech=/data/mc_speech \
+#     --dataset-path bigos=/data/bigos \
+#     --dataset-path no_speech=/data/no_speech \
+#     --dataset-path dinner_party=/data/dinner_party
+
+mode: "vad"
+model_name: "vad_pl"
+
+datasets:
+  positive:
+    - "mc_speech"
+    - "bigos"
+  negative:
+    - "no_speech"
+    - "dinner_party"
+    - "musan"
+    - "fma"
+
+dataset_paths: {}
+
+# openWakeWord still expects these standard knobs.
+# In VAD mode target_phrase/custom_negative_phrases are effectively placeholders.
+target_phrase:
+  - "speech"
+custom_negative_phrases: []
+
+n_samples: 12000
+n_samples_val: 2000
+vad_positive_samples: 12000
+vad_negative_samples: 16000
+vad_validation_samples: 2000
+augmentation_batch_size: 16
+augmentation_rounds: 1
+
+piper_sample_generator_path: "data/piper-sample-generator"
+output_dir: "output"
+
+rir_paths:
+  - "data/mit_rirs"
+
+background_paths:
+  - "data/audioset_16k"
+  - "data/fma_small"
+  - "data/musan"
+
+background_paths_duplication_rate:
+  - 1
+  - 1
+  - 1
+
+false_positive_validation_data_path: "data/validation_set_features.npy"
+feature_data_files:
+  "ACAV100M_sample": "data/openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
+
+batch_n_per_class:
+  "ACAV100M_sample": 1024
+  "adversarial_negative": 0
+  "positive": 96
+
+model_type: "dnn"
+layer_size: 32
+steps: 30000
+max_negative_weight: 1500
+target_false_positives_per_hour: 0.2
+
+export_manifest:
+  esphome_vad: true
+  wake_word: "vad"
+  trained_languages: ["pl"]
+  author: "ha-wakeword-trainer"
+  website: "https://github.com/lgpearson1771/openwakeword-trainer"
+  # Placeholder for later ONNX->TFLite conversion / packaging step.
+  model: "vad_pl.tflite"
+  probability_cutoff: 0.5
+  sliding_window_size: 5
+  tensor_arena_size: 24000
+  feature_step_size: 10
+  minimum_esphome_version: "2024.7.0"
