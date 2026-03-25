@@ -1,622 +1,278 @@
-# 🏠 HA Wake Word Trainer
+# openwakeword-trainer
 
-All-in-one training script for custom [microWakeWord](https://github.com/OHF-Voice/micro-wake-word) models compatible with **Home Assistant Voice PE** and **ESPHome**.
+Train custom wake word models with [openWakeWord](https://github.com/dscripka/openWakeWord). A granular 13-step pipeline with compatibility patches for torchaudio 2.10+, Piper TTS, and speechbrain. Generates tiny ONNX models (~200 KB) for real-time keyword detection — like building your own "Hey Siri" trigger.
 
-Train your own wake word in any language — just run the script and wait!
+## What It Does
 
-[![Home Assistant](https://img.shields.io/badge/Home%20Assistant-Compatible-blue?logo=homeassistant)](https://www.home-assistant.io/)
-[![ESPHome](https://img.shields.io/badge/ESPHome-Ready-green?logo=esphome)](https://esphome.io/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+This toolkit automates the entire openWakeWord training process. It now also supports a practical **VAD mode** for training a Polish speech-vs-non-speech classifier from datasets selected in the CLI/script.
 
-## Features
+1. **Synthesizes** thousands of speech clips using Piper TTS with varied voices and accents
+2. **Augments** clips with real-world noise, music, and room impulse responses
+3. **Trains** a small DNN classifier optimized for always-on, low-latency detection
+4. **Exports** a tiny ONNX model you can deploy anywhere
 
-- 🎤 **Automatic sample generation** using Edge TTS (Microsoft's neural voices)
-- 📥 **Auto-downloads all training data** (~5GB, cached for future runs)
-- 🌍 **Multi-language support**: Polish, English, German, Spanish, French
-- 🧠 **Smart augmentation**: Room acoustics, background noise, music
-- 📦 **Ready-to-use output**: `.tflite` model + `.json` manifest for ESPHome
-- 🔧 **Auto-patches** TensorFlow compatibility issues
+The result is a ~200 KB model that runs on CPU in real-time with negligible resource usage.
 
-## Requirements
+## Prerequisites
 
-### System Requirements
-- **OS**: WSL2 Ubuntu 22.04+ (recommended) or native Linux
-- **Python**: 3.10 or higher
-- **RAM**: 8GB minimum, 16GB recommended
-- **Disk**: ~10GB free space (for datasets)
-- **CPU**: Multi-core recommended (training is CPU-intensive)
+| Requirement | Details |
+|-------------|---------|
+| **WSL2 or Linux** | Ubuntu recommended (`wsl --install -d Ubuntu` on Windows) |
+| **NVIDIA GPU** | CUDA drivers installed (WSL2 includes CUDA passthrough automatically) |
+| **Disk space** | ~15 GB free (temporary downloads; deletable after training) |
+| **Python 3.10+** | Inside WSL2/Linux (`python3 --version`) |
+| **Time** | ~1–2 hours with GPU, 12–24 hours CPU-only |
 
-### Quick Setup (Automatic)
-
-The easiest way to set up everything:
+### Verify CUDA (WSL2)
 
 ```bash
-# Download and run the setup script
-wget https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/setup_environment.sh
-chmod +x setup_environment.sh
-./setup_environment.sh
+wsl
+nvidia-smi
 ```
 
-This automatically:
-- Installs system dependencies (ffmpeg, python3, etc.)
-- Creates a Python virtual environment
-- Installs all required packages with correct versions
-- Clones and installs micro-wake-word
-- Downloads the training script
-- Patches known compatibility issues
-
-After setup, just run:
-```bash
-source ~/wakeword-env/bin/activate
-python ~/train_wakeword.py "Hey Jarvis" --lang en
-```
-
-### Manual Setup
-
-If you prefer to set up manually:
-
-```bash
-# 1. Install system dependencies
-sudo apt update && sudo apt install -y python3 python3-pip python3-venv ffmpeg git wget
-
-# 2. Create and activate virtual environment
-python3 -m venv ~/wakeword-env
-source ~/wakeword-env/bin/activate
-
-# 3. Install Python packages (ORDER MATTERS!)
-pip install --upgrade pip wheel setuptools
-pip install 'numpy>=1.24.0,<2.0'
-pip install 'pyarrow>=12.0.0,<15.0.0'
-pip install tensorflow==2.16.1
-pip install datasets==2.14.0
-pip install edge-tts soundfile librosa scipy pyyaml requests tqdm mmap-ninja webrtcvad
-
-# 4. Clone and install micro-wake-word
-git clone https://github.com/OHF-Voice/micro-wake-word.git ~/micro-wake-word
-cd ~/micro-wake-word && pip install -e .
-
-# 5. Apply compatibility patch
-sed -i 's/\.numpy()//g' ~/micro-wake-word/microwakeword/train.py
-
-# 6. Download the trainer script
-wget -O ~/train_wakeword.py https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/train_wakeword.py
-```
-
-### Using requirements.txt
-
-Alternatively, after creating your virtual environment:
-
-```bash
-source ~/wakeword-env/bin/activate
-pip install -r https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/requirements.txt
-```
-
-### Windows Users (WSL2 Required)
-
-Native Windows is **not supported** due to TensorFlow limitations. Use WSL2:
-
-### Common Issues
-
-#### `ModuleNotFoundError: No module named 'tensorflow.lite.experimental'`
-**Cause:** TensorFlow 2.16+ removed the `tensorflow.lite.experimental.microfrontend` module.
-**Fix:** If using manual setup, apply the patch to micro-wake-word or use the provided `setup_environment.sh` which handles this automatically.
-
-#### FFmpeg not found (Windows)
-**Cause:** FFmpeg is not installed or not in PATH.
-**Fix:** Download from https://www.gyan.dev/ffmpeg/builds/ and add `bin/` folder to PATH.
-
-#### MUSAN download rate limited
-**Cause:** HuggingFace rate limiting.
-**Fix:** Training will continue without MUSAN (optional dataset). For best results, wait 1-2 hours and retry, or create a HuggingFace account and set `HF_TOKEN`.
-
-```powershell
-# In PowerShell (Admin)
-wsl --install -d Ubuntu-22.04
-```
-
-Then follow the Linux setup instructions inside WSL2.
-
-### GPU Support (Optional)
-
-GPU training often has compatibility issues with newer cards (RTX 40xx/50xx). 
-The script defaults to CPU training, which works reliably.
-
-If you want to try GPU:
-1. Install CUDA toolkit in WSL2
-2. Run with `--cpu_only=False`
-
-Note: CPU training takes 15-30 minutes, which is acceptable for most use cases.
+You should see your GPU listed. If not, update your NVIDIA Windows driver to the latest version.
 
 ## Quick Start
 
-### Basic Usage
+### Option A: One-liner
 
 ```bash
-# Polish wake word
-python train_wakeword.py "Hej Zgredek"
+# From PowerShell (Windows) — cd to the repo first:
+cd path\to\openwakeword-trainer
+wsl -- bash train.sh
 
-# English wake word  
-python train_wakeword.py "Hey Jarvis" --lang en
-
-# With custom variations
-python train_wakeword.py "Hey Computer" --lang en --variations "Hey PC,Yo Computer"
+# Or from within WSL2/Linux:
+cd /mnt/c/path/to/openwakeword-trainer
+bash train.sh
 ```
 
-### Output
+This creates an isolated virtualenv, installs dependencies, downloads datasets, trains the model, and exports the result.
 
-After training completes, you'll find:
-```
-./wakeword_training/
-├── hej_zgredek.tflite    # Model file (~100KB)
-├── hej_zgredek.json      # ESPHome manifest
-├── generated_samples/     # TTS audio files
-├── augmented_features/    # Processed spectrograms
-└── trained_model/         # Training checkpoints
-```
-
-## Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `wake_word` | (required) | The wake word phrase to train |
-| `--variations` | "" | Comma-separated alternative phrasings |
-| `--lang` | "pl" | Language: pl, en, de, es, fr |
-| `--output_dir` | "./wakeword_training" | Output directory |
-| `--steps` | 10000 | Training steps |
-| `--batch_size` | 128 | Batch size for training |
-| `--author` | "custom" | Author name for manifest |
-| `--probability_cutoff` | 0.7 | Detection threshold (0.0-1.0) |
-| `--data_dir` | None | Path to existing augmentation data |
-| `--skip_generate` | False | Skip TTS sample generation |
-| `--skip_download` | False | Skip dataset downloads |
-
-## Examples
-
-### Polish Wake Word (Recommended Settings)
-```bash
-python train_wakeword.py "Hej Zgredek" \
-    --variations "Hej Zgredku,hej zgredek,Heej Zgredek" \
-    --steps 15000 \
-    --author "myname"
-```
-
-### English Wake Word with High Accuracy
-```bash
-python train_wakeword.py "Hey Assistant" \
-    --lang en \
-    --steps 20000 \
-    --probability_cutoff 0.8
-```
-
-### Quick Test Run (Lower Quality)
-```bash
-python train_wakeword.py "Test Word" \
-    --lang en \
-    --steps 5000
-```
-
-### Reuse Downloaded Data
-```bash
-# First run downloads everything
-python train_wakeword.py "Wake Word One" --output_dir ./training1
-
-# Second run reuses the data (much faster!)
-python train_wakeword.py "Wake Word Two" --data_dir ./training1 --output_dir ./training2
-```
-
-## Training Time
-
-| Phase | First Run | Subsequent Runs |
-|-------|-----------|-----------------|
-| Sample generation | 5-10 min | 5-10 min |
-| Dataset download | 30-60 min | Skipped (cached) |
-| Feature generation | 10-20 min | 10-20 min |
-| Model training | 10-30 min | 10-30 min |
-| **Total** | **1-2 hours** | **25-60 min** |
-
-*Times based on modern CPU. Training uses CPU by default (GPU often has compatibility issues with new hardware).*
-
-## Parameter Trade-offs
-
-### Training Steps (`--steps`)
-| Value | Quality | Time | Use Case |
-|-------|---------|------|----------|
-| 5000 | Low | ~5 min | Quick testing |
-| 10000 | Good | ~15 min | Default, most use cases |
-| 15000 | Better | ~25 min | Production models |
-| 20000+ | Best | ~35+ min | Maximum accuracy |
-
-### Probability Cutoff (`--probability_cutoff`)
-| Value | False Positives | False Negatives | Use Case |
-|-------|-----------------|-----------------|----------|
-| 0.5 | Many | Few | Very responsive, noisy |
-| 0.7 | Balanced | Balanced | **Default, recommended** |
-| 0.8 | Few | Some | Quiet environments |
-| 0.9 | Rare | Many | High-precision needed |
-
-## Choosing Cutoff Based on Training Results
-
-After training completes, the script outputs metrics like:
-
-```
-INFO:absl:Cutoff 0.86: frr=0.0818; faph=0.000
-INFO:absl:Cutoff 0.85: frr=0.0818; faph=0.187
-INFO:absl:Cutoff 0.81: frr=0.0793; faph=0.562
-INFO:absl:Cutoff 0.75: frr=0.0691; faph=0.750
-INFO:absl:Cutoff 0.67: frr=0.0588; faph=0.937
-```
-
-### Understanding the Metrics
-
-| Metric | Full Name | Meaning |
-|--------|-----------|---------|
-| **frr** | False Rejection Rate | % of wake words NOT detected (lower = better) |
-| **faph** | False Accepts Per Hour | How often it triggers incorrectly (lower = better) |
-| **Cutoff** | Probability Threshold | The `probability_cutoff` value for ESPHome |
-
-### How to Choose
-
-1. **Find your acceptable faph**: 
-   - `0.0` = Never triggers incorrectly (but may miss wake words)
-   - `0.5-1.0` = Triggers falsely ~once per hour (reasonable)
-   - `2.0+` = May be annoying in quiet environments
-
-2. **Check the frr at that cutoff**:
-   - `< 5%` = Excellent (misses 1 in 20 wake words)
-   - `5-10%` = Good (misses 1 in 10-20)
-   - `> 10%` = May feel unresponsive
-
-3. **Balance based on your use case**:
-
-| Environment | Recommended faph | Typical Cutoff |
-|-------------|------------------|----------------|
-| Noisy (kitchen, living room) | 1.0-2.0 | 0.60-0.70 |
-| Quiet (bedroom, office) | 0.0-0.5 | 0.80-0.90 |
-| Mixed/General | 0.5-1.0 | 0.70-0.80 |
-
-### Example Decision
-
-From the training output above:
-- At cutoff **0.75**: frr=6.9%, faph=0.75 → **Balanced choice**
-- At cutoff **0.85**: frr=8.2%, faph=0.19 → **Fewer false triggers, slightly less responsive**
-- At cutoff **0.67**: frr=5.9%, faph=0.94 → **More responsive, ~1 false trigger/hour**
-
-**Recommendation**: Start with the cutoff where `faph < 1.0` and `frr < 10%`, then adjust based on real-world testing.
-
-### Quick Reference Table
-
-| Your Priority | Choose Cutoff Where |
-|---------------|---------------------|
-| Never miss wake word | faph ~1-2, lowest frr |
-| Never false trigger | faph = 0, accept higher frr |
-| Balanced | faph < 1.0, frr < 10% |
-
-### Language-Specific Tips
-
-| Language | Recommended Variations | Notes |
-|----------|----------------------|-------|
-| Polish | Add vocative case (e.g., "Zgredku") | Edge TTS handles Polish well |
-| English | Add informal variants | Multiple accents available |
-| German | Include formal/informal | Good voice quality |
-
-## Deploying to ESPHome
-
-After training completes, you'll have two files:
-- `your_wake_word.tflite` — The model (~100KB)
-- `your_wake_word.json` — Manifest for ESPHome
-
-### Step 1: Create a GitHub Repository
-
-If you don't have one yet:
+### Option B: Step-by-step
 
 ```bash
-# Install GitHub CLI (if not installed)
-sudo apt install gh
+# Enter WSL2 and navigate to the repo
+wsl
+cd /mnt/c/path/to/openwakeword-trainer
 
-# Login to GitHub
-gh auth login
+# Create & activate a training venv (use native filesystem, not /mnt/c/)
+python3 -m venv ~/.oww-trainer-venv
+source ~/.oww-trainer-venv/bin/activate
 
-# Create a new repo
-gh repo create my-wake-word --public --description "Custom wake word model"
+# Install dependencies
+pip install -r requirements.txt
 
-# Clone it
-git clone https://github.com/YOUR_USERNAME/my-wake-word
-cd my-wake-word
+# Run the full pipeline
+python train_wakeword.py
+
+# Or resume from where you left off
+python train_wakeword.py --from augment
 ```
 
-### Step 2: Upload Files to GitHub Releases
+### Train Your Own Wake Word
 
-**Option A: Using GitHub Web Interface (Easiest)**
-
-1. Go to your repo: `https://github.com/YOUR_USERNAME/my-wake-word`
-2. Click **"Releases"** (right sidebar)
-3. Click **"Create a new release"**
-4. Fill in:
-   - **Tag**: `v1.0.0`
-   - **Title**: `Wake Word Model v1.0.0`
-   - **Description**: Your wake word name and settings
-5. **Drag and drop** both `.tflite` and `.json` files into the "Attach binaries" area
-6. Click **"Publish release"**
-
-**Option B: Using GitHub CLI**
-
-```bash
-cd ~/wakeword_training
-
-# Create a release with both files
-gh release create v1.0.0 \
-    --repo YOUR_USERNAME/my-wake-word \
-    --title "Wake Word Model v1.0.0" \
-    --notes "Custom wake word: Hey Jarvis" \
-    hey_jarvis.tflite \
-    hey_jarvis.json
-```
-
-**Option C: Using Git + Web Upload**
-
-```bash
-cd my-wake-word
-
-# Copy files
-cp ~/wakeword_training/hey_jarvis.* .
-
-# Commit to repo (optional, for backup)
-git add .
-git commit -m "Add wake word model"
-git push
-
-# Then create release via web interface and upload files
-```
-
-### Step 3: Get the Raw URL
-
-After creating the release, your files will be available at:
-```
-https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.json
-https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.tflite
-```
-
-The JSON manifest should point to the tflite file. Edit `hey_jarvis.json` before uploading:
-
-```json
-{
-  "version": 2,
-  "wake_word": "hey jarvis",
-  "author": "your_name",
-  "model": "https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.tflite",
-  "micro": {
-    "probability_cutoff": 0.7,
-    "sliding_window_size": 5
-  }
-}
-```
-
-**Important**: The `model` field in JSON must contain the **full URL** to the `.tflite` file!
-
-### Step 4: Update ESPHome Config
-
-Edit your Voice PE YAML file (e.g., `voice-pe.yaml`):
-
-```yaml
-micro_wake_word:
-  models:
-    # Your custom wake word
-    - model: https://github.com/YOUR_USERNAME/my-wake-word/releases/download/v1.0.0/hey_jarvis.json
-      probability_cutoff: 0.7
-      sliding_window_size: 5
-    
-    # Backup wake word (optional but recommended)
-    - model: okay_nabu
-```
-
-**Configuration Options:**
-
-| Option | Description | Recommended |
-|--------|-------------|-------------|
-| `probability_cutoff` | Detection threshold (0.0-1.0) | Start with 0.7 |
-| `sliding_window_size` | Consecutive detections needed | 5 (default) |
-
-### Step 5: Flash Your Device
-
-```bash
-# Using ESPHome CLI
-esphome run voice-pe.yaml
-
-# Or via Home Assistant ESPHome add-on
-# Go to ESPHome Dashboard → Your Device → Install
-```
-
-### Step 6: Test and Tune
-
-1. **Say your wake word** clearly from 1-2 meters
-2. **Check logs** for detection events:
+1. Copy the example config:
    ```bash
-   esphome logs voice-pe.yaml
+   cp configs/hey_echo.yaml configs/my_word.yaml
    ```
 
-**Tuning Tips:**
+2. Edit `configs/my_word.yaml`:
+   ```yaml
+   model_name: "my_word"
+   target_phrase:
+     - "hey computer"
+   custom_negative_phrases:
+     - "hey commuter"
+     - "computer"
+     - "hey"
+   ```
 
-| Problem | Solution |
-|---------|----------|
-| Not responding | Lower `probability_cutoff` to 0.5-0.6 |
-| Too many false triggers | Raise `probability_cutoff` to 0.8-0.9 |
-| Inconsistent detection | Increase `sliding_window_size` to 7-10 |
-| Works close but not far | Retrain with more variations |
+3. Train:
+   ```bash
+   python train_wakeword.py --config configs/my_word.yaml
+   ```
 
-### Complete Example
+4. Find your model in `export/my_word.onnx` (and `export/my_word.onnx.data`).
 
-Here's a complete Voice PE config with custom wake word:
+### Train a Polish VAD model from datasets
 
-```yaml
-esphome:
-  name: voice-assistant
-  friendly_name: Voice Assistant
+Use `configs/polish_vad.yaml` when you want **speech vs non-speech** instead of a phrase detector.
 
-esp32:
-  board: esp32-s3-devkitc-1
-  framework:
-    type: esp-idf
-
-# ... (other config like wifi, api, etc.)
-
-micro_wake_word:
-  models:
-    - model: https://github.com/lukcz/ha-wakeword-trainer/releases/download/v1.0.0/hej_zgredek.json
-      probability_cutoff: 0.7
-      sliding_window_size: 5
-  on_wake_word_detected:
-    - light.turn_on:
-        id: led_ring
-        effect: "Listening"
-    - voice_assistant.start:
-
-voice_assistant:
-  microphone: mic
-  speaker: speaker
-  on_end:
-    - light.turn_off: led_ring
+```bash
+python train_wakeword.py \
+  --config configs/polish_vad.yaml \
+  --mode vad \
+  --positive-datasets mc_speech,bigos \
+  --negative-datasets no_speech,dinner_party,musan,fma \
+  --dataset-path mc_speech=/data/polish/mc_speech \
+  --dataset-path bigos=/data/polish/bigos \
+  --dataset-path no_speech=/data/no_speech \
+  --dataset-path dinner_party=/data/dinner_party
 ```
+
+Notes:
+- Positive datasets should contain **real speech clips** (Polish speech, multiple speakers).
+- Negative datasets should contain **non-speech / ambience / music**.
+- In VAD mode the script skips Piper clip synthesis and instead prepares `positive_train`, `positive_test`, `negative_train`, and `negative_test` directly from the selected datasets.
+- Export also writes an ESPHome-style VAD manifest JSON with `wake_word: "vad"`. The repo still trains/export ONNX, so a later ONNX→TFLite conversion step is still needed for direct ESPHome deployment.
+
+## Pipeline Steps
+
+The pipeline runs **13 granular steps**, each with built-in verification. If any step fails, it stops immediately and tells you exactly how to resume.
+
+| # | Step | Description | Time |
+|---|------|-------------|------|
+| 1 | `check-env` | Verify Python, CUDA, critical imports | instant |
+| 2 | `apply-patches` | Patch torchaudio/speechbrain/piper compat | instant |
+| 3 | `download` | Download datasets, Piper TTS model, tools | ~30 min |
+| 4 | `verify-data` | Check all data files present & sizes | instant |
+| 5 | `resolve-config` | Resolve config paths to absolute | instant |
+| 6 | `generate` | Generate clips via Piper TTS | ~10 min (GPU) |
+| 7 | `resample-clips` | Spot-check clip sample rates | instant |
+| 8 | `verify-clips` | Verify clip counts and directories | instant |
+| 9 | `augment` | Augment clips & extract mel features | ~30 min |
+| 10 | `verify-features` | Check `.npy` feature files & shapes | instant |
+| 11 | `train` | Train DNN model + ONNX export | ~30 min (GPU) |
+| 12 | `verify-model` | Load-test with ONNX Runtime | instant |
+| 13 | `export` | Copy model to `export/` directory | instant |
+
+If any step fails:
+```
+Pipeline stopped.  Fix the issue above, then resume:
+  python train_wakeword.py --from <failed-step>
+```
+
+## CLI Reference
+
+```bash
+# Full pipeline (all 13 steps)
+python train_wakeword.py
+
+# Use a custom config
+python train_wakeword.py --config configs/my_word.yaml
+
+# Resume from a specific step
+python train_wakeword.py --from augment
+
+# Run exactly one step
+python train_wakeword.py --step verify-clips
+
+# Check current state without side effects
+python train_wakeword.py --verify-only
+
+# Show all available steps
+python train_wakeword.py --list-steps
+
+# VAD mode with dataset selection overrides
+python train_wakeword.py --config configs/polish_vad.yaml --mode vad \
+  --positive-datasets mc_speech,bigos \
+  --negative-datasets no_speech,dinner_party,musan,fma \
+  --dataset-path mc_speech=/abs/path/to/mc_speech
+```
+
+## Using Your Model
+
+The export step produces two files that must be kept together:
+
+- `hey_echo.onnx` — the model graph (~14 KB)
+- `hey_echo.onnx.data` — external weights (~200 KB)
+
+Copy **both** files to your project. The trained model works with any openWakeWord-compatible runtime:
+
+```python
+from openwakeword.model import Model
+
+oww = Model(wakeword_models=["export/hey_echo.onnx"])
+
+# Feed 16 kHz audio frames
+prediction = oww.predict(audio_frame)
+```
+
+Or with ONNX Runtime directly:
+
+```python
+import onnxruntime as ort
+import numpy as np
+
+sess = ort.InferenceSession("export/hey_echo.onnx")
+# Input shape: [1, 16, 96] (mel spectrogram features)
+result = sess.run(None, {"x": features})
+```
+
+## Configuration Reference
+
+See [configs/hey_echo.yaml](configs/hey_echo.yaml) for a fully commented example. Key settings:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `model_name` | — | Name for the model (used for filenames) |
+| `target_phrase` | — | List of phrases to detect |
+| `custom_negative_phrases` | `[]` | Phrases to explicitly reject |
+| `n_samples` | `50000` | Number of positive training clips |
+| `tts_batch_size` | `25` | Piper TTS batch size (reduce for low VRAM) |
+| `model_type` | `"dnn"` | `"dnn"` or `"rnn"` |
+| `layer_size` | `32` | Hidden layer size (32=fast, 64/128=higher capacity) |
+| `steps` | `50000` | Training steps |
+| `target_false_positives_per_hour` | `0.2` | Target false positive rate |
+
+## Threshold Tuning
+
+After training, tune the detection threshold for your use case:
+
+| Problem | Fix |
+|---------|-----|
+| False activations (triggers when you didn't say it) | Increase threshold: 0.5 → 0.6 → 0.7 |
+| Missed activations (need to over-pronounce) | Decrease threshold: 0.5 → 0.4 → 0.3 |
+| False triggers on similar words | Add to `custom_negative_phrases` and retrain |
+
+## Compatibility Patches
+
+This toolkit includes automatic patches for known breaking changes in modern dependency versions:
+
+| Issue | Affected | Patch |
+|-------|----------|-------|
+| `torchaudio.load()` removed | torchaudio ≥2.10 | Soundfile-based replacement with automatic 22050→16000 Hz resampling |
+| `torchaudio.info()` removed | torchaudio ≥2.10 | Soundfile-based metadata reader |
+| `torchaudio.list_audio_backends()` removed | torchaudio ≥2.10 | Returns `["soundfile"]` for speechbrain compat |
+| `pkg_resources` removed | setuptools ≥82 | Auto-installs setuptools<82 |
+| Piper API change | piper-sample-generator v2+ | Auto-resolves `model=` kwarg |
+
+Patches are applied and verified automatically during the `apply-patches` step.
+
+## Cleanup
+
+After training, reclaim disk space:
+
+```bash
+rm -rf data/          # ~12 GB of downloaded datasets
+rm -rf output/        # intermediate training artifacts
+```
+
+Keep only the `export/` directory with your trained model.
 
 ## Troubleshooting
 
-### "Module not found" errors
-```bash
-pip install edge-tts datasets==2.14.0 soundfile librosa pyyaml requests tqdm
-pip install 'numpy<2' 'pyarrow>=12,<15' tensorflow==2.16.1
-```
+### `piper-phonemize` fails to install
+This package only has Linux wheels. Make sure you're running inside WSL2, not native Windows.
 
-### Training crashes with GPU errors
-The script uses CPU by default. If you want to try GPU:
-```bash
-python train_wakeword.py "Wake Word" --cpu_only=False
-```
-Note: RTX 40xx/50xx series may have compatibility issues with TensorFlow.
+### `nvidia-smi` not found in WSL2
+Update your NVIDIA Windows driver to the latest version. WSL2 CUDA passthrough is included automatically.
 
-### "numpy.ndarray has no attribute numpy"
-The script auto-patches this. If it persists:
-```bash
-# Manual fix
-sed -i 's/\.numpy()//' /path/to/micro-wake-word/microwakeword/train.py
-```
+### Training is very slow
+Verify CUDA is available: `python -c "import torch; print(torch.cuda.is_available())"`. If `False`, everything falls back to CPU.
 
-### Downloads fail or timeout
-```bash
-# Use existing data from another training
-python train_wakeword.py "New Word" --data_dir /path/to/previous/training
-```
+### Out of GPU memory
+Reduce `tts_batch_size` in your config (e.g., 25 → 10).
 
-### Model not responding to wake word
-1. Lower `probability_cutoff` to 0.5-0.6
-2. Add more phrase variations
-3. Increase training steps to 15000+
-4. Check if TTS pronunciation matches your speech
-
-### Too many false activations
-1. Raise `probability_cutoff` to 0.8-0.9
-2. Increase `negative_class_weight` in code
-3. Use a more distinctive wake word (2+ syllables)
-
-### No .tflite file after training
-Sometimes the automatic conversion fails. Run manual conversion:
-
-```bash
-cd ~/micro-wake-word
-
-CUDA_VISIBLE_DEVICES=-1 python -m microwakeword.model_train_eval \
-    --training_config='/path/to/your/training_parameters.yaml' \
-    --train 0 \
-    --restore_checkpoint 1 \
-    --test_tflite_streaming_quantized 1 \
-    --use_weights "best_weights" \
-    mixednet \
-    --pointwise_filters "64,64,64,64" \
-    --repeat_in_block "1,1,1,1" \
-    --mixconv_kernel_sizes '[5], [7,11], [9,15], [23]' \
-    --residual_connection "0,0,0,0" \
-    --first_conv_filters 32 \
-    --first_conv_kernel_size 5 \
-    --stride 3
-```
-
-Key: `--train 0` skips training and only converts the model.
-
-The .tflite file will be in:
-```
-trained_model/tflite_stream_state_internal_quant/stream_state_internal_quant.tflite
-```
-
-## How It Works
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. SAMPLE GENERATION                                        │
-│    Edge TTS → Multiple voices, speeds, pitches              │
-│    "Hej Zgredek" → 2000+ audio variations                   │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 2. AUGMENTATION                                             │
-│    + Room acoustics (MIT RIRs)                              │
-│    + Background music (FMA)                                 │
-│    + Environmental sounds (AudioSet)                        │
-│    + Noise, EQ, pitch shifts                                │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 3. TRAINING                                                 │
-│    MixedNet CNN architecture                                │
-│    Positive samples + Negative samples                      │
-│    10000 steps → 99%+ accuracy                              │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 4. EXPORT                                                   │
-│    Quantized TFLite model (~100KB)                          │
-│    JSON manifest for ESPHome                                │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Model Architecture
-
-The script uses the **MixedNet** architecture optimized for wake word detection:
-
-| Layer | Filters | Description |
-|-------|---------|-------------|
-| Conv1D | 32 | Initial feature extraction |
-| MixConv Block 1 | 64 | Kernel sizes: [5] |
-| MixConv Block 2 | 64 | Kernel sizes: [7, 11] |
-| MixConv Block 3 | 64 | Kernel sizes: [9, 15] |
-| MixConv Block 4 | 64 | Kernel sizes: [23] |
-| Output | 1 | Wake word probability |
-
-**Model size**: ~100KB (quantized)  
-**Parameters**: ~26,000  
-**Inference**: ~10ms per frame on ESP32-S3
-
-## Datasets Used
-
-| Dataset | Size | Purpose |
-|---------|------|---------|
-| Generated samples | ~500MB | Positive wake word examples |
-| MIT RIRs | ~500MB | Room acoustics simulation |
-| FMA (music) | ~2GB | Background music augmentation |
-| Negative datasets | ~1GB | Speech/noise that's NOT the wake word |
-
-All datasets are automatically downloaded on first run and cached for future use.
-
-## Credits
-
-- [microWakeWord](https://github.com/OHF-Voice/micro-wake-word) by Kevin Ahrendt
-- [Edge TTS](https://github.com/rany2/edge-tts) for sample generation
-- [ESPHome](https://esphome.io/) for device integration
-- Training data from MIT, FMA, AudioSet, and HuggingFace
+### Download stalls
+Re-run the script — all downloads are idempotent and resume where they left off.
 
 ## License
 
-MIT License - Use freely for personal and commercial projects.
+MIT — see [LICENSE](LICENSE).
 
----
+## Acknowledgments
 
-Made with ❤️ for the Home Assistant community
-
-Created by [lukcz](https://github.com/lukcz) with help from 🧦 Zgredek
+- [openWakeWord](https://github.com/dscripka/openWakeWord) by David Scripka
+- [Piper](https://github.com/rhasspy/piper) by Rhasspy for synthetic TTS
+- Built with PyTorch, ONNX Runtime, and speechbrain
