@@ -207,6 +207,11 @@ def _write_dataset_audio(
     return count
 
 
+def _split_spec_parts(split_spec: str) -> list[str]:
+    normalized = split_spec.replace(",", "+")
+    return [part.strip() for part in normalized.split("+") if part.strip()]
+
+
 def _download_fleurs_dataset(dataset_cfg: dict) -> None:
     from datasets import load_dataset
 
@@ -221,8 +226,18 @@ def _download_fleurs_dataset(dataset_cfg: dict) -> None:
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset = load_dataset("google/fleurs", hf_config, split=split, streaming=True)
-    count = _write_dataset_audio(dataset, output_dir, "fleurs", max_clips, io_workers)
+    count = 0
+    for split_name in _split_spec_parts(split):
+        if count >= max_clips:
+            break
+        dataset = load_dataset("google/fleurs", hf_config, split=split_name, streaming=True)
+        count += _write_dataset_audio(
+            dataset,
+            output_dir,
+            "fleurs",
+            max_clips - count,
+            io_workers,
+        )
     log.info("  Saved %d FLEURS clips to %s", count, output_dir)
 
 
