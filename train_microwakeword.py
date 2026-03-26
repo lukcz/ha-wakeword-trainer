@@ -390,27 +390,46 @@ def _download_fma_subset(dest: Path, limit: int = 200) -> None:
         return
 
     dest.mkdir(parents=True, exist_ok=True)
-    dataset = load_dataset(
-        "rudraml/fma",
-        name="small",
-        split="train",
-        streaming=True,
-        trust_remote_code=True,
-    )
+
+    def write_subset(dataset) -> int:
+        count = 0
+        for row in dataset:
+            if count >= limit:
+                break
+            try:
+                audio = row["audio"]
+                sf.write(
+                    dest / f"fma_{count:04d}.wav",
+                    np.asarray(audio["array"], dtype="float32"),
+                    audio["sampling_rate"],
+                )
+                count += 1
+            except Exception:
+                continue
+        return count
+
     count = 0
-    for row in dataset:
-        if count >= limit:
-            break
-        try:
-            audio = row["audio"]
-            sf.write(
-                dest / f"fma_{count:04d}.wav",
-                np.asarray(audio["array"], dtype="float32"),
-                audio["sampling_rate"],
-            )
-            count += 1
-        except Exception:
-            continue
+
+    try:
+        dataset = load_dataset(
+            "rudraml/fma",
+            name="small",
+            split="train",
+            streaming=True,
+            trust_remote_code=True,
+        )
+        count = write_subset(dataset)
+    except Exception as exc:
+        log.warning("  Streaming FMA download failed, retrying non-streaming subset: %s", exc)
+        dataset = load_dataset(
+            "rudraml/fma",
+            name="small",
+            split=f"train[:{limit}]",
+            streaming=False,
+            trust_remote_code=True,
+        )
+        count = write_subset(dataset)
+
     log.info("  Saved %d FMA clips", count)
 
 
