@@ -214,6 +214,13 @@ def _dataset_overrides_from_env() -> dict[str, str]:
     return overrides
 
 
+def _use_large_acav_features(cfg: dict) -> bool:
+    raw = os.environ.get("OWW_USE_ACAV100M_FEATURES")
+    if raw is not None:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(cfg.get("use_acav100m_features", False))
+
+
 def _get_mode(cfg: dict) -> str:
     return str(cfg.get("mode") or cfg.get("training_type") or "wakeword").lower()
 
@@ -388,11 +395,14 @@ def step_download() -> bool:
         log.info("  VAD mode: skipping Piper download (positives come from datasets)")
 
     # 3c — ACAV100M pre-computed negative features
-    _download(
-        URLS["acav100m_features"],
-        DATA_DIR / "openwakeword_features_ACAV100M_2000_hrs_16bit.npy",
-        "ACAV100M negative features (~7.5 GB)",
-    )
+    if mode != "vad" or _use_large_acav_features(cfg):
+        _download(
+            URLS["acav100m_features"],
+            DATA_DIR / "openwakeword_features_ACAV100M_2000_hrs_16bit.npy",
+            "ACAV100M negative features (~7.5 GB)",
+        )
+    else:
+        log.info("  VAD mode: skipping ACAV100M negative features download (set OWW_USE_ACAV100M_FEATURES=1 to enable)")
 
     # 3d — Validation features
     _download(
@@ -456,6 +466,8 @@ def step_verify_data() -> bool:
     # Large feature / model files
     for relpath, min_bytes in MIN_SIZES.items():
         if mode == "vad" and relpath.endswith("en_US-libritts_r-medium.pt"):
+            continue
+        if mode == "vad" and relpath.endswith("openwakeword_features_ACAV100M_2000_hrs_16bit.npy") and not _use_large_acav_features(cfg):
             continue
         fp = DATA_DIR / relpath
         if not fp.exists():
@@ -532,6 +544,9 @@ def step_resolve_config() -> bool:
     for key, relpath in cfg.get("feature_data_files", {}).items():
         resolved_features[key] = str((SCRIPT_DIR / relpath).resolve())
     cfg["feature_data_files"] = resolved_features
+
+    if mode == "vad" and not _use_large_acav_features(cfg):
+        cfg["feature_data_files"] = {}
 
     if "false_positive_validation_data_path" in cfg:
         cfg["false_positive_validation_data_path"] = str(
