@@ -151,10 +151,10 @@ fi
 echo -e "${GREEN}  ✓ micro-wake-word installed${NC}"
 
 # =============================================================================
-# STEP 5: Download Training Script
+# STEP 5: Download helper script
 # =============================================================================
 echo ""
-echo -e "${YELLOW}[5/5] Downloading training script...${NC}"
+echo -e "${YELLOW}[5/5] Downloading helper script...${NC}"
 
 SCRIPT_URL="https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/train_wakeword.py"
 SCRIPT_PATH="$HOME/train_wakeword.py"
@@ -162,7 +162,7 @@ SCRIPT_PATH="$HOME/train_wakeword.py"
 wget -O "$SCRIPT_PATH" "$SCRIPT_URL"
 chmod +x "$SCRIPT_PATH"
 
-echo -e "${GREEN}  ✓ Training script downloaded to $SCRIPT_PATH${NC}"
+echo -e "${GREEN}  ✓ Helper script downloaded to $SCRIPT_PATH${NC}"
 
 # =============================================================================
 # DONE!
@@ -172,14 +172,16 @@ echo "╔═══════════════════════�
 echo "║  ✅ Setup Complete!                                          ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║                                                              ║"
-echo "║  To start training:                                          ║"
+echo "║  To start training correctly:                                ║"
 echo "║                                                              ║"
+echo "║    git clone https://github.com/lukcz/ha-wakeword-trainer.git║"
+echo "║    cd ha-wakeword-trainer                                    ║"
 echo "║    source ~/wakeword-env/bin/activate                        ║"
-echo "║    python ~/train_wakeword.py \"Hey Jarvis\" --lang en        ║"
+echo "║    pip install -r requirements.txt                           ║"
+echo "║    python train_wakeword.py --config configs/polish_vad.yaml ║"
 echo "║                                                              ║"
-echo "║  Or for Polish:                                              ║"
-echo "║                                                              ║"
-echo "║    python ~/train_wakeword.py \"Hej Zgredek\"                  ║"
+echo "║  Note: ~/train_wakeword.py is only a helper copy.            ║"
+echo "║  For VAD mode and configs, run from a repo checkout.         ║"
 echo "║                                                              ║"
 echo "║  First run will download ~5GB of training data.              ║"
 echo "║  Subsequent runs will be much faster (~30 min).              ║"

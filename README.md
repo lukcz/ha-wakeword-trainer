@@ -48,26 +48,9 @@ bash train.sh
 
 This creates an isolated virtualenv, installs dependencies, downloads datasets, trains the model, and exports the result.
 
-### Option A2: Download-and-run with wget
+### Option A2: Bootstrap the environment with `wget`
 
-If you don't want to clone the repo first, you can grab the setup script directly:
-
-```bash
-wget https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/setup_environment.sh
-chmod +x setup_environment.sh
-./setup_environment.sh
-```
-
-After setup finishes:
-
-```bash
-source ~/wakeword-env/bin/activate
-python ~/train_wakeword.py
-```
-
-### Option A2: Download-and-run with wget
-
-If you don't want to clone the repo first, you can grab the setup script directly:
+If you want a quick one-time environment bootstrap, you can download only the setup script:
 
 ```bash
 wget https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/setup_environment.sh
@@ -75,12 +58,19 @@ chmod +x setup_environment.sh
 ./setup_environment.sh
 ```
 
-After setup finishes:
+**Important:** the setup script prepares the Python environment, but for normal use you should still run training from a **repo checkout**, not from `~/train_wakeword.py`.
+
+Recommended next steps:
 
 ```bash
+git clone https://github.com/lukcz/ha-wakeword-trainer.git
+cd ha-wakeword-trainer
 source ~/wakeword-env/bin/activate
-python ~/train_wakeword.py
+pip install -r requirements.txt
+python train_wakeword.py --config configs/polish_vad.yaml --mode vad --verify-only
 ```
+
+Why: VAD mode depends on repo-local files such as `configs/polish_vad.yaml`, `requirements.txt`, and supporting scripts. Running only `python ~/train_wakeword.py` from your home directory can fail because those files are not next to the downloaded script.
 
 ### Manual Setup (classic trainer path)
 
