@@ -60,10 +60,12 @@ cd ~/ha-wakeword-trainer
 - instaluje paczki z `requirements.txt`
 - pobiera dane tła i walidacyjne potrzebne do treningu
 - dla VAD:
-  - jeśli nie ma negatywnych danych, pipeline pobiera publiczne subsety tła / muzyki / noise
-  - jeśli nie ma pozytywnych danych mowy, generuje awaryjny polski fallback speech przez `edge-tts`
+  - jeśli brakuje `bigos`, pipeline próbuje pobrać prawdziwy BIGOS, potem publiczny polski FLEURS, a na końcu fallback speech przez `edge-tts`
+  - jeśli brakuje `no_speech`, pipeline generuje zestaw room tone / hum / silence-like WAV
+  - jeśli brakuje `dinner_party`, pipeline generuje gęste tło typu crowd/babble z miksu mowy i ambientu
+  - jeśli nie ma innych negatywnych danych, pipeline nadal pobiera publiczne subsety tła / muzyki / noise
 
-To oznacza, że `./train.sh vad` powinno wystartować bez ręcznego wrzucania datasetów. Własne dane nadal są lepsze, ale repo nie blokuje się już na pustym `data/`.
+To oznacza, że `./train.sh vad` powinno wystartować bez ręcznego wrzucania datasetów, także gdy w configu są `bigos`, `no_speech` i `dinner_party`. Własne dane nadal są lepsze, ale repo nie blokuje się już na pustym `data/`.
 
 ## Najprostsze komendy
 
