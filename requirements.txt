@@ -31,3 +31,6 @@ mmap-ninja>=0.8.0
 # Audio processing
 webrtcvad>=2.0.10
 audioread>=3.0.0
+
+# Training backend used by oww_wrapper.py
+nanowakeword[train]>=2.0.2,<2.1
