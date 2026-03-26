@@ -12,6 +12,7 @@ import subprocess
 import sys
 import textwrap
 import zipfile
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
@@ -155,15 +156,65 @@ def _link_or_copy(src: Path, dest: Path) -> None:
         shutil.copy2(src, dest)
 
 
-def _download_fleurs_dataset(dataset_cfg: dict) -> None:
-    import numpy as np
+def _resolve_io_workers(cfg: dict | None = None, default: int = 4) -> int:
+    if not cfg:
+        return default
+    return max(1, int(cfg.get("io_workers", default)))
+
+
+def _write_audio_file(dest: Path, samples, sampling_rate: int) -> None:
     import soundfile as sf
+
+    sf.write(dest, samples, sampling_rate)
+
+
+def _write_dataset_audio(
+    dataset,
+    output_dir: Path,
+    prefix: str,
+    max_clips: int | None,
+    io_workers: int,
+) -> int:
+    import numpy as np
+
+    count = 0
+    futures = set()
+
+    with ThreadPoolExecutor(max_workers=max(1, io_workers)) as executor:
+        for row in dataset:
+            if max_clips is not None and count >= max_clips:
+                break
+
+            try:
+                audio = row["audio"]
+                samples = np.asarray(audio["array"], dtype="float32")
+                sampling_rate = audio["sampling_rate"]
+            except Exception:
+                continue
+
+            dest = output_dir / f"{prefix}_{count:06d}.wav"
+            futures.add(executor.submit(_write_audio_file, dest, samples, sampling_rate))
+            count += 1
+
+            if len(futures) >= io_workers * 4:
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+
+        for future in futures:
+            future.result()
+
+    return count
+
+
+def _download_fleurs_dataset(dataset_cfg: dict) -> None:
     from datasets import load_dataset
 
     output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/fleurs_pl")))
     max_clips = int(dataset_cfg.get("max_clips", 1200))
     split = str(dataset_cfg.get("split", "train+validation"))
     hf_config = str(dataset_cfg.get("hf_config", "pl_pl"))
+    io_workers = _resolve_io_workers(dataset_cfg)
 
     if output_dir.exists() and any(output_dir.iterdir()):
         log.info("  FLEURS dataset already present at %s", output_dir)
@@ -171,28 +222,17 @@ def _download_fleurs_dataset(dataset_cfg: dict) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset = load_dataset("google/fleurs", hf_config, split=split, streaming=True)
-    count = 0
-    for row in dataset:
-        if count >= max_clips:
-            break
-        audio = row["audio"]
-        sf.write(
-            output_dir / f"fleurs_{count:06d}.wav",
-            np.asarray(audio["array"], dtype="float32"),
-            audio["sampling_rate"],
-        )
-        count += 1
+    count = _write_dataset_audio(dataset, output_dir, "fleurs", max_clips, io_workers)
     log.info("  Saved %d FLEURS clips to %s", count, output_dir)
 
 
 def _download_bigos_dataset(dataset_cfg: dict) -> None:
-    import numpy as np
-    import soundfile as sf
     from datasets import load_dataset
 
     output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/bigos")))
     max_clips = int(dataset_cfg.get("max_clips", 2000))
     split = str(dataset_cfg.get("split", "train"))
+    io_workers = _resolve_io_workers(dataset_cfg)
 
     if output_dir.exists() and any(output_dir.iterdir()):
         log.info("  BIGOS dataset already present at %s", output_dir)
@@ -200,17 +240,7 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset = load_dataset("amu-cai/pl-asr-bigos-v2", split=split)
-    count = 0
-    for row in dataset:
-        if count >= max_clips:
-            break
-        audio = row["audio"]
-        sf.write(
-            output_dir / f"bigos_{count:06d}.wav",
-            np.asarray(audio["array"], dtype="float32"),
-            audio["sampling_rate"],
-        )
-        count += 1
+    count = _write_dataset_audio(dataset, output_dir, "bigos", max_clips, io_workers)
     log.info("  Saved %d BIGOS clips to %s", count, output_dir)
 
 
@@ -318,9 +348,7 @@ def step_prepare_tools() -> bool:
         return False
 
 
-def _download_mit_rirs(dest: Path) -> None:
-    import numpy as np
-    import soundfile as sf
+def _download_mit_rirs(dest: Path, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
     if dest.exists() and any(dest.iterdir()):
@@ -334,21 +362,11 @@ def _download_mit_rirs(dest: Path) -> None:
         streaming=True,
         trust_remote_code=True,
     )
-    count = 0
-    for row in dataset:
-        audio = row["audio"]
-        sf.write(
-            dest / f"rir_{count:04d}.wav",
-            np.asarray(audio["array"], dtype="float32"),
-            audio["sampling_rate"],
-        )
-        count += 1
+    count = _write_dataset_audio(dataset, dest, "rir", None, io_workers)
     log.info("  Saved %d RIR files", count)
 
 
-def _download_audioset_subset(dest: Path, limit: int = 300) -> None:
-    import numpy as np
-    import soundfile as sf
+def _download_audioset_subset(dest: Path, limit: int = 300, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
     if dest.exists() and any(dest.iterdir()):
@@ -363,26 +381,11 @@ def _download_audioset_subset(dest: Path, limit: int = 300) -> None:
         streaming=True,
         trust_remote_code=True,
     )
-    count = 0
-    for row in dataset:
-        if count >= limit:
-            break
-        try:
-            audio = row["audio"]
-            sf.write(
-                dest / f"audioset_{count:04d}.wav",
-                np.asarray(audio["array"], dtype="float32"),
-                audio["sampling_rate"],
-            )
-            count += 1
-        except Exception:
-            continue
+    count = _write_dataset_audio(dataset, dest, "audioset", limit, io_workers)
     log.info("  Saved %d AudioSet clips", count)
 
 
-def _download_fma_subset(dest: Path, limit: int = 200) -> None:
-    import numpy as np
-    import soundfile as sf
+def _download_fma_subset(dest: Path, limit: int = 200, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
     if dest.exists() and any(dest.iterdir()):
@@ -390,23 +393,6 @@ def _download_fma_subset(dest: Path, limit: int = 200) -> None:
         return
 
     dest.mkdir(parents=True, exist_ok=True)
-
-    def write_subset(dataset) -> int:
-        count = 0
-        for row in dataset:
-            if count >= limit:
-                break
-            try:
-                audio = row["audio"]
-                sf.write(
-                    dest / f"fma_{count:04d}.wav",
-                    np.asarray(audio["array"], dtype="float32"),
-                    audio["sampling_rate"],
-                )
-                count += 1
-            except Exception:
-                continue
-        return count
 
     count = 0
 
@@ -418,7 +404,7 @@ def _download_fma_subset(dest: Path, limit: int = 200) -> None:
             streaming=True,
             trust_remote_code=True,
         )
-        count = write_subset(dataset)
+        count = _write_dataset_audio(dataset, dest, "fma", limit, io_workers)
     except Exception as exc:
         log.warning("  Streaming FMA download failed, retrying non-streaming subset: %s", exc)
         dataset = load_dataset(
@@ -428,7 +414,7 @@ def _download_fma_subset(dest: Path, limit: int = 200) -> None:
             streaming=False,
             trust_remote_code=True,
         )
-        count = write_subset(dataset)
+        count = _write_dataset_audio(dataset, dest, "fma", limit, io_workers)
 
     log.info("  Saved %d FMA clips", count)
 
@@ -464,11 +450,20 @@ def step_download_assets() -> bool:
     asset_cfg = cfg.get("asset_subsets", {}) or {}
     audioset_max_clips = int(asset_cfg.get("audioset_max_clips", 300))
     fma_max_clips = int(asset_cfg.get("fma_max_clips", 200))
+    io_workers = _resolve_io_workers(asset_cfg)
 
     try:
-        _download_mit_rirs(DATA_DIR / "mit_rirs")
-        _download_audioset_subset(DATA_DIR / "audioset_16k", limit=audioset_max_clips)
-        _download_fma_subset(DATA_DIR / "fma_16k", limit=fma_max_clips)
+        _download_mit_rirs(DATA_DIR / "mit_rirs", io_workers=io_workers)
+        _download_audioset_subset(
+            DATA_DIR / "audioset_16k",
+            limit=audioset_max_clips,
+            io_workers=io_workers,
+        )
+        _download_fma_subset(
+            DATA_DIR / "fma_16k",
+            limit=fma_max_clips,
+            io_workers=io_workers,
+        )
 
         neg_root = _negative_datasets_dir(cfg)
         for name in _negative_feature_names(cfg):

@@ -37,6 +37,7 @@ negative_feature_sets:
 asset_subsets:
   audioset_max_clips: 300
   fma_max_clips: 200
+  io_workers: 8
 
 negative_feature_weights:
   speech: 8.0

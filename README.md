@@ -43,6 +43,7 @@ You can tune the locally downloaded ambient subsets in that config:
 
 - `asset_subsets.audioset_max_clips`
 - `asset_subsets.fma_max_clips`
+- `asset_subsets.io_workers`
 
 The VAD flow:
 
