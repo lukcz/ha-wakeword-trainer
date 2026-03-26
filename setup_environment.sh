@@ -72,7 +72,7 @@ main() {
   source "$venv_dir/bin/activate"
 
   log "Upgrading pip tooling"
-  python -m pip install --upgrade pip wheel setuptools
+  python -m pip install --upgrade pip wheel "setuptools<81"
 
   log "Installing Python requirements"
   python -m pip install -r "$repo_dir/requirements.txt"
