@@ -8,7 +8,7 @@ from any step, or run a single step in isolation.
 
 Usage:
     python train_wakeword.py                                  # full pipeline
-    python train_wakeword.py --config configs/my_word.yaml    # custom config
+    python train_wakeword.py --config configs/wakeword_example.yaml
     python train_wakeword.py --from augment                   # resume
     python train_wakeword.py --step verify-clips              # one step
     python train_wakeword.py --verify-only                    # check state
@@ -21,10 +21,12 @@ See README.md for full setup instructions.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import glob
 import json
 import logging
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -41,7 +43,7 @@ import yaml
 SCRIPT_DIR = Path(__file__).resolve().parent           # project root
 DATA_DIR   = SCRIPT_DIR / "data"
 OUTPUT_DIR = SCRIPT_DIR / "output"
-DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "hey_echo.yaml"
+DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "wakeword_example.yaml"
 RESOLVED_CONFIG = OUTPUT_DIR / "_resolved_config.yaml"
 OWW_WRAPPER = SCRIPT_DIR / "oww_wrapper.py"
 
@@ -182,6 +184,23 @@ def _load_config(path: Path | None = None) -> dict:
         return yaml.safe_load(f)
 
 
+def _load_active_config() -> dict:
+    """Prefer the resolved config once available so later steps see CLI overrides."""
+    if RESOLVED_CONFIG.exists():
+        return _load_config(RESOLVED_CONFIG)
+    return _load_config(CONFIG_FILE)
+
+
+def _require_local_helper(path: Path, purpose: str) -> bool:
+    """Fail with a clear message when required helper files are missing."""
+    if path.exists():
+        return True
+    log.error("  Missing required helper: %s", path)
+    log.error("  %s", purpose)
+    log.error("  This repo contains the pipeline entrypoint, but that helper is not present.")
+    return False
+
+
 def _dataset_overrides_from_env() -> dict[str, str]:
     raw = os.environ.get("OWW_DATASET_PATHS", "").strip()
     overrides = {}
@@ -294,6 +313,12 @@ def step_check_env() -> bool:
 
 def step_apply_patches() -> bool:
     """Apply compatibility monkey-patches and verify they work."""
+    compat_path = SCRIPT_DIR / "compat.py"
+    if not _require_local_helper(
+        compat_path,
+        "The apply-patches step needs compat.py to patch torchaudio, speechbrain, and Piper.",
+    ):
+        return False
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
     import compat
@@ -546,6 +571,86 @@ def _resample_audio_file(src: Path, dest: Path) -> None:
     sf.write(str(dest), data, 16000)
 
 
+def _build_vad_fallback_sentences() -> list[str]:
+    prompts = [
+        "Wlacz swiatlo w salonie.",
+        "Wylacz telewizor w sypialni.",
+        "Jaka bedzie pogoda jutro rano?",
+        "Ustaw temperature na dwadziescia dwa stopnie.",
+        "Odtworz spokojna muzyke.",
+        "Zamknij rolety w kuchni.",
+        "Czy frontowe drzwi sa zamkniete?",
+        "Nastepny alarm ustaw na siodma rano.",
+        "Wlacz odkurzacz za dziesiec minut.",
+        "Pokaz zuzycie energii dzisiaj.",
+        "Przelacz lampke nocna na cieply kolor.",
+        "Czy pralka skonczyla pranie?",
+    ]
+    variants = [
+        "Prosze {base}",
+        "{base}",
+        "Hej asystencie, {base}",
+        "Mozesz {base}",
+        "Sprawdz prosze: {base}",
+    ]
+    sentences = []
+    for base in prompts:
+        for variant in variants:
+            sentences.append(variant.format(base=base.lower()))
+    return sentences
+
+
+async def _generate_edge_tts_dataset(dest: Path, count: int = 120) -> int:
+    import edge_tts
+
+    voices = [
+        "pl-PL-MarekNeural",
+        "pl-PL-ZofiaNeural",
+    ]
+    sentences = _build_vad_fallback_sentences()
+    random.seed(42)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    generated = 0
+    for idx in range(count):
+        text = random.choice(sentences)
+        voice = voices[idx % len(voices)]
+        out_path = dest / f"synthetic_pl_{idx:04d}.mp3"
+        if out_path.exists():
+            generated += 1
+            continue
+        try:
+            await edge_tts.Communicate(text=text, voice=voice).save(str(out_path))
+            generated += 1
+        except Exception as exc:
+            log.warning("  Edge TTS fallback failed for sample %d: %s", idx, exc)
+            break
+    return generated
+
+
+def _ensure_vad_positive_fallback(min_count: int = 120) -> list[Path]:
+    fallback_dir = DATA_DIR / "synthetic_pl_speech"
+    existing = _iter_audio_files(fallback_dir) if fallback_dir.exists() else []
+    if len(existing) >= min_count:
+        log.info("  Using bundled fallback speech dataset: %d clips", len(existing))
+        return existing
+
+    log.warning("  No positive speech datasets found. Generating fallback Polish speech with Edge TTS...")
+    try:
+        generated = asyncio.run(_generate_edge_tts_dataset(fallback_dir, count=min_count))
+    except ImportError:
+        log.error("  edge-tts is not installed, so fallback speech generation is unavailable.")
+        return []
+    except Exception as exc:
+        log.error("  Failed to generate fallback Polish speech dataset: %s", exc)
+        return []
+
+    if generated == 0:
+        return []
+
+    return _iter_audio_files(fallback_dir)
+
+
 def _prepare_vad_training_clips(cfg: dict) -> bool:
     model_name = cfg.get('model_name', 'vad')
     model_dir = OUTPUT_DIR / model_name
@@ -568,6 +673,11 @@ def _prepare_vad_training_clips(cfg: dict) -> bool:
             positive_files.extend(_iter_audio_files(path))
         else:
             log.warning('  Positive dataset missing: %s -> %s', name, path)
+
+    if len(positive_files) < 2:
+        fallback_positive = _ensure_vad_positive_fallback()
+        if fallback_positive:
+            positive_files.extend(fallback_positive)
 
     negative_files = []
     for name, path in _resolve_dataset_paths(cfg, 'negative'):
@@ -617,6 +727,12 @@ def step_generate() -> bool:
 
     log.info("  Generating clips via openwakeword + Piper TTS …")
     log.info("  (Longest step — ~10 min on GPU, hours on CPU)")
+
+    if not _require_local_helper(
+        OWW_WRAPPER,
+        "Wake word clip generation depends on oww_wrapper.py calling the openWakeWord backend.",
+    ):
+        return False
 
     try:
         _run([
@@ -682,8 +798,7 @@ def step_verify_clips() -> bool:
 
     ok = True
 
-    with open(CONFIG_FILE) as f:
-        cfg = yaml.safe_load(f)
+    cfg = _load_active_config()
 
     expected_positive = cfg.get("n_samples", 50000)
     model_name = cfg.get("model_name", "my_wakeword")
@@ -739,6 +854,11 @@ def step_augment() -> bool:
         return False
 
     log.info("  Augmenting clips & extracting features …")
+    if not _require_local_helper(
+        OWW_WRAPPER,
+        "Feature augmentation depends on oww_wrapper.py calling the training backend.",
+    ):
+        return False
     try:
         _run([
             sys.executable, str(OWW_WRAPPER),
@@ -810,6 +930,11 @@ def step_train() -> bool:
     steps = cfg.get("steps", 50000)
     log.info("  Training %s for %d steps …", model_name, steps)
 
+    if not _require_local_helper(
+        OWW_WRAPPER,
+        "Model training depends on oww_wrapper.py calling the training backend.",
+    ):
+        return False
     try:
         _run([
             sys.executable, str(OWW_WRAPPER),
@@ -826,8 +951,7 @@ def step_train() -> bool:
 
 def step_verify_model() -> bool:
     """Verify the ONNX model was produced and can be loaded."""
-    with open(CONFIG_FILE) as f:
-        cfg = yaml.safe_load(f)
+    cfg = _load_active_config()
 
     model_name = cfg["model_name"]
     model_path = OUTPUT_DIR / f"{model_name}.onnx"
@@ -901,7 +1025,7 @@ def _write_esphome_vad_manifest(cfg: dict, export_dir: Path, model_name: str) ->
 
 def step_export() -> bool:
     """Copy the trained model to the export/ directory for easy retrieval."""
-    cfg = _load_config()
+    cfg = _load_active_config()
 
     model_name = cfg["model_name"]
     model_path = OUTPUT_DIR / f"{model_name}.onnx"
@@ -1173,7 +1297,7 @@ def main() -> None:
         epilog=textwrap.dedent("""\
             Examples:
               python train_wakeword.py                                    # full pipeline
-              python train_wakeword.py --config configs/my_word.yaml      # custom config
+              python train_wakeword.py --config configs/wakeword_example.yaml
               python train_wakeword.py --from augment                     # resume
               python train_wakeword.py --step verify-clips                # run one step
               python train_wakeword.py --verify-only                      # check state
@@ -1182,7 +1306,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--config", type=str, default=None, metavar="FILE",
-        help="Path to training config YAML (default: configs/hey_echo.yaml).",
+        help="Path to training config YAML (default: configs/wakeword_example.yaml).",
     )
     parser.add_argument(
         "--step", type=str, default=None, metavar="NAME",
