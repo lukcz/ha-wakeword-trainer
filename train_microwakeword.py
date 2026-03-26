@@ -247,6 +247,7 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
     output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/bigos")))
     max_clips = int(dataset_cfg.get("max_clips", 2000))
     split = str(dataset_cfg.get("split", "train"))
+    hf_config = str(dataset_cfg.get("hf_config", "all"))
     io_workers = _resolve_io_workers(dataset_cfg)
 
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -254,7 +255,12 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset = load_dataset("amu-cai/pl-asr-bigos-v2", split=split)
+    dataset = load_dataset(
+        "amu-cai/pl-asr-bigos-v2",
+        hf_config,
+        split=split,
+        trust_remote_code=True,
+    )
     count = _write_dataset_audio(dataset, output_dir, "bigos", max_clips, io_workers)
     log.info("  Saved %d BIGOS clips to %s", count, output_dir)
 

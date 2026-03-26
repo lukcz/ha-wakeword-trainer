@@ -16,6 +16,7 @@ bootstrap_speech_datasets:
     enabled: true
     optional: true
     output_dir: "data/bigos"
+    hf_config: "all"
     split: "train"
     max_clips: 2000
   - kind: "fleurs"
