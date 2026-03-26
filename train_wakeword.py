@@ -551,6 +551,17 @@ def step_resolve_config() -> bool:
     cfg["background_paths"] = [
         str((SCRIPT_DIR / p).resolve()) for p in cfg.get("background_paths", [])
     ]
+    if mode == "vad":
+        raw_rates = list(cfg.get("background_paths_duplication_rate", []))
+        kept_paths = []
+        kept_rates = []
+        for idx, path_str in enumerate(cfg["background_paths"]):
+            path = Path(path_str)
+            if path.is_dir() and any(path.iterdir()):
+                kept_paths.append(path_str)
+                kept_rates.append(raw_rates[idx] if idx < len(raw_rates) else 1)
+        cfg["background_paths"] = kept_paths
+        cfg["background_paths_duplication_rate"] = kept_rates
     resolved_features = {}
     for key, relpath in cfg.get("feature_data_files", {}).items():
         resolved_features[key] = str((SCRIPT_DIR / relpath).resolve())
