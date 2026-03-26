@@ -5,7 +5,7 @@ REPO_URL="${REPO_URL:-https://github.com/lukcz/ha-wakeword-trainer.git}"
 REPO_DIR="${REPO_DIR:-$HOME/ha-wakeword-trainer}"
 
 log() {
-  printf '[setup] %s\n' "$*"
+  printf '[setup] %s\n' "$*" >&2
 }
 
 need_cmd() {
@@ -56,6 +56,12 @@ main() {
   local repo_dir
   repo_dir="$(resolve_repo_dir)"
   local venv_dir="$repo_dir/.venv"
+
+  chmod +x \
+    "$repo_dir/setup_environment.sh" \
+    "$repo_dir/train.sh" \
+    "$repo_dir/train_vad_full.sh" \
+    "$repo_dir/train_wakeword_full.sh"
 
   if [[ ! -d "$venv_dir" ]]; then
     log "Creating virtual environment in $venv_dir"
