@@ -64,24 +64,6 @@ After setup finishes:
 source ~/wakeword-env/bin/activate
 python ~/train_wakeword.py
 ```
-
-### Option A2: Download-and-run with wget
-
-If you don't want to clone the repo first, you can grab the setup script directly:
-
-```bash
-wget https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/setup_environment.sh
-chmod +x setup_environment.sh
-./setup_environment.sh
-```
-
-After setup finishes:
-
-```bash
-source ~/wakeword-env/bin/activate
-python ~/train_wakeword.py
-```
-
 ### Manual Setup (classic trainer path)
 
 If you prefer to set things up manually inside WSL2/Linux:
