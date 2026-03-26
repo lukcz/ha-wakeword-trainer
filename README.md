@@ -95,6 +95,13 @@ pip install -r https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/
 
 Native Windows is **not supported** due to TensorFlow limitations. Use WSL2:
 
+```powershell
+# In PowerShell (Admin)
+wsl --install -d Ubuntu-22.04
+```
+
+Then follow the Linux setup instructions inside WSL2.
+
 ### Common Issues
 
 #### `ModuleNotFoundError: No module named 'tensorflow.lite.experimental'`
@@ -109,12 +116,21 @@ Native Windows is **not supported** due to TensorFlow limitations. Use WSL2:
 **Cause:** HuggingFace rate limiting.
 **Fix:** Training will continue without MUSAN (optional dataset). For best results, wait 1-2 hours and retry, or create a HuggingFace account and set `HF_TOKEN`.
 
-```powershell
-# In PowerShell (Admin)
-wsl --install -d Ubuntu-22.04
-```
+### About VAD (Voice Activity Detection)
 
-Then follow the Linux setup instructions inside WSL2.
+This repository trains a **wake-word model**, not a standalone VAD model.
+
+- **Wake word detection** answers: "did the user say the target phrase?"
+- **VAD** answers: "is there speech in this audio at all?"
+
+Why this matters:
+- You may still see `webrtcvad` in the dependency list because parts of the broader audio/tooling stack use it.
+- The exported files from this repo are a **custom wake-word `.tflite` + `.json` manifest** for `micro_wake_word`.
+- If your Home Assistant / ESPHome voice pipeline also uses VAD, that VAD is configured separately from the wake-word model trained here.
+
+Practical rule of thumb:
+- If the device wakes too easily on random sounds, tune the **wake-word threshold** first.
+- If the device has trouble deciding whether anyone is speaking at all, that is usually a **VAD / voice pipeline** issue, not a problem with the trained wake-word model itself.
 
 ### GPU Support (Optional)
 
