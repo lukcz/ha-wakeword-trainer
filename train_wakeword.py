@@ -484,7 +484,18 @@ def step_verify_data() -> bool:
             log.info("  OK: %-60s  %.0f MB", relpath, sz_mb)
 
     # Directories that should contain files
-    for name in ["mit_rirs", "audioset_16k", "fma_small"]:
+    required_dirs = ["mit_rirs"]
+    background_dirs = {
+        "audioset": "audioset_16k",
+        "fma": "fma_small",
+        "musan": "musan",
+    }
+    for dataset_name in _get_dataset_names(cfg, "negative"):
+        mapped = background_dirs.get(dataset_name)
+        if mapped and mapped not in required_dirs:
+            required_dirs.append(mapped)
+
+    for name in required_dirs:
         d = DATA_DIR / name
         if not d.is_dir():
             log.error("  MISSING dir: %s", d)
