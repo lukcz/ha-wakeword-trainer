@@ -33,6 +33,11 @@ negative_feature_sets:
   - "no_speech"
   - "dinner_party_eval"
 
+# Size of locally downloaded ambient subsets used during augmentation.
+asset_subsets:
+  audioset_max_clips: 300
+  fma_max_clips: 200
+
 negative_feature_weights:
   speech: 8.0
   dinner_party: 10.0

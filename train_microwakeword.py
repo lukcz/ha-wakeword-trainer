@@ -461,11 +461,14 @@ def _negative_feature_names(cfg: dict) -> list[str]:
 def step_download_assets() -> bool:
     cfg = _load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    asset_cfg = cfg.get("asset_subsets", {}) or {}
+    audioset_max_clips = int(asset_cfg.get("audioset_max_clips", 300))
+    fma_max_clips = int(asset_cfg.get("fma_max_clips", 200))
 
     try:
         _download_mit_rirs(DATA_DIR / "mit_rirs")
-        _download_audioset_subset(DATA_DIR / "audioset_16k")
-        _download_fma_subset(DATA_DIR / "fma_16k")
+        _download_audioset_subset(DATA_DIR / "audioset_16k", limit=audioset_max_clips)
+        _download_fma_subset(DATA_DIR / "fma_16k", limit=fma_max_clips)
 
         neg_root = _negative_datasets_dir(cfg)
         for name in _negative_feature_names(cfg):

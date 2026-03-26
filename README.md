@@ -39,6 +39,11 @@ cp configs/microwakeword_example.yaml configs/my_model.yaml
 
 This uses `configs/polish_vad.yaml` by default.
 
+You can tune the locally downloaded ambient subsets in that config:
+
+- `asset_subsets.audioset_max_clips`
+- `asset_subsets.fma_max_clips`
+
 The VAD flow:
 
 1. downloads augmentation assets
