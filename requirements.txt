@@ -5,8 +5,8 @@
 edge-tts>=6.0.0
 
 # Data handling
-# Python 3.12 support is much safer with newer Hugging Face Datasets releases.
-datasets>=2.19.2,<3.0.0
+# Keep Datasets on the 2.19.x line because 2.20+ requires pyarrow>=15.
+datasets>=2.19.2,<2.20.0
 huggingface_hub>=0.20.0
 soundfile>=0.12.0
 librosa>=0.10.0
