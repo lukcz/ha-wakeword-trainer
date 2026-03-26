@@ -179,24 +179,196 @@ python train_wakeword.py --from augment
 
 Use `configs/polish_vad.yaml` when you want **speech vs non-speech** instead of a phrase detector.
 
+## VAD mode: complete workflow
+
+### What VAD mode does
+
+In `--mode vad`, the pipeline does **not** synthesize a target phrase with Piper.
+Instead it:
+
+1. reads **real speech clips** from your positive datasets
+2. reads **non-speech / ambience / music** from your negative datasets
+3. resamples everything to **16 kHz mono WAV**
+4. prepares these splits under `output/<model_name>/`:
+   - `positive_train`
+   - `positive_test`
+   - `negative_train`
+   - `negative_test`
+5. runs augmentation / feature extraction / training as usual
+6. exports:
+   - `export/<model_name>.onnx`
+   - `export/<model_name>.onnx.data` (if external weights are used)
+   - `export/<model_name>.json` (ESPHome-style VAD manifest)
+
+This means VAD mode is for **speech-vs-non-speech classification**, not wake phrase detection.
+
+### Supported dataset names
+
+The built-in dataset registry currently recognizes these names:
+
+| Dataset name | Kind | Intended content |
+|---|---|---|
+| `mc_speech` | positive | Polish speech clips |
+| `bigos` | positive | Polish speech clips |
+| `pl_speech` | positive | Additional Polish speech clips |
+| `no_speech` | negative | Silence / HVAC / room tone |
+| `dinner_party` | negative | Crowd / babble / kitchen ambience |
+| `musan` | negative | MUSAN noise / music / speech negatives |
+| `fma` | negative | FMA music |
+| `audioset` | negative | AudioSet background audio |
+
+You can point any of them to local folders with repeated `--dataset-path name=/abs/path` flags.
+
+### Expected input data
+
+**Positive datasets** should contain:
+- real human speech
+- many speakers
+- different microphones / rooms if possible
+- audio files in `.wav`, `.flac`, or `.mp3`
+
+**Negative datasets** should contain:
+- silence / room tone
+- household noise
+- music
+- ambience
+- ideally **not** clean foreground speech
+
+Important:
+- The script currently requires at least **2 positive** and **2 negative** audio files to proceed.
+- If a selected dataset path does not exist, the script logs a warning.
+- In practice you want **thousands** of clips for a useful VAD, not the bare minimum.
+
+### Minimal example
+
 ```bash
 python train_wakeword.py \
   --config configs/polish_vad.yaml \
   --mode vad \
-  --positive-datasets mc_speech,bigos \
-  --negative-datasets no_speech,dinner_party,musan,fma \
+  --positive-datasets mc_speech \
+  --negative-datasets no_speech,musan \
   --dataset-path mc_speech=/data/polish/mc_speech \
-  --dataset-path bigos=/data/polish/bigos \
-  --dataset-path no_speech=/data/no_speech \
-  --dataset-path dinner_party=/data/dinner_party
+  --dataset-path no_speech=/data/no_speech
 ```
 
-Notes:
-- Positive datasets should contain **real speech clips** (Polish speech, multiple speakers).
-- Negative datasets should contain **non-speech / ambience / music**.
-- In VAD mode the script skips Piper clip synthesis and instead prepares `positive_train`, `positive_test`, `negative_train`, and `negative_test` directly from the selected datasets.
-- Export also writes an ESPHome-style VAD manifest JSON with `wake_word: "vad"`. The repo still trains/export ONNX, so a later ONNX→TFLite conversion step is still needed for direct ESPHome deployment.
-- This VAD workflow is intended as a practical training/orchestration path in this repo; final ESPHome deployment still needs the model packaging/conversion step.
+### Recommended full example
+
+```bash
+python train_wakeword.py \
+  --config configs/polish_vad.yaml \
+  --mode vad \
+  --positive-datasets mc_speech,bigos,pl_speech \
+  --negative-datasets no_speech,dinner_party,musan,fma,audioset \
+  --dataset-path mc_speech=/data/polish/mc_speech \
+  --dataset-path bigos=/data/polish/bigos \
+  --dataset-path pl_speech=/data/polish/extra_speech \
+  --dataset-path no_speech=/data/no_speech \
+  --dataset-path dinner_party=/data/dinner_party \
+  --dataset-path musan=/data/musan \
+  --dataset-path fma=/data/fma_small \
+  --dataset-path audioset=/data/audioset_16k
+```
+
+### Resume a failed VAD run
+
+```bash
+python train_wakeword.py --config configs/polish_vad.yaml --mode vad --from augment
+```
+
+### Run only one VAD step
+
+```bash
+python train_wakeword.py --config configs/polish_vad.yaml --mode vad --step verify-clips
+```
+
+### Inspect only, without side effects
+
+```bash
+python train_wakeword.py --config configs/polish_vad.yaml --mode vad --verify-only
+```
+
+### VAD CLI parameters
+
+These CLI flags are supported directly by `train_wakeword.py` for VAD workflows:
+
+| Flag | Description |
+|---|---|
+| `--config FILE` | Path to YAML config, e.g. `configs/polish_vad.yaml` |
+| `--mode vad` | Forces VAD mode even if config says otherwise |
+| `--positive-datasets CSV` | Comma-separated positive dataset names |
+| `--negative-datasets CSV` | Comma-separated negative dataset names |
+| `--dataset-path NAME=PATH` | Override a dataset location; repeat as needed |
+| `--from NAME` | Resume pipeline from a specific step |
+| `--step NAME` | Run exactly one step |
+| `--verify-only` | Run only verify steps |
+| `--list-steps` | Print all pipeline step names |
+
+### VAD config parameters (`configs/polish_vad.yaml`)
+
+These settings matter most in VAD mode:
+
+| Key | Example | Meaning |
+|---|---|---|
+| `mode` | `"vad"` | Enables speech-vs-non-speech flow |
+| `model_name` | `"vad_pl"` | Output model basename |
+| `datasets.positive` | `["mc_speech", "bigos"]` | Positive dataset names |
+| `datasets.negative` | `["no_speech", "musan", "fma"]` | Negative dataset names |
+| `dataset_paths` | `{}` | Optional dataset path overrides in YAML |
+| `vad_positive_samples` | `12000` | Number of positive training clips to use |
+| `vad_negative_samples` | `16000` | Number of negative training clips to use |
+| `vad_validation_samples` | `2000` | Validation/test clips per class |
+| `n_samples` | `12000` | Fallback positive count if VAD-specific key is missing |
+| `n_samples_val` | `2000` | Fallback validation count |
+| `augmentation_batch_size` | `16` | Batch size for augmentation step |
+| `augmentation_rounds` | `1` | Number of augmentation passes |
+| `model_type` | `"dnn"` | openWakeWord classifier type |
+| `layer_size` | `32` | Hidden layer width |
+| `steps` | `30000` | Training steps |
+| `target_false_positives_per_hour` | `0.2` | Target FPR used during training/tuning |
+| `export_manifest.*` | see config | ESPHome VAD manifest metadata |
+
+### How sample limits work in VAD mode
+
+The script slices files in this order:
+- first `vad_positive_samples` files → `positive_train`
+- next `vad_validation_samples` files → `positive_test`
+- first `vad_negative_samples` files → `negative_train`
+- next `vad_validation_samples` files → `negative_test`
+
+If there are not enough files for the test split, it falls back to the first available files.
+So for good train/test separation, provide **more audio files than the configured limits**.
+
+### Output files
+
+After a successful VAD run, expect:
+
+```text
+output/vad_pl/
+  positive_train/
+  positive_test/
+  negative_train/
+  negative_test/
+
+export/
+  vad_pl.onnx
+  vad_pl.onnx.data
+  vad_pl.json
+```
+
+The JSON manifest is written in ESPHome-style format with fields such as:
+- `wake_word: "vad"`
+- `trained_languages`
+- `micro.probability_cutoff`
+- `micro.sliding_window_size`
+- `micro.tensor_arena_size`
+- `micro.feature_step_size`
+
+### Notes and caveats
+
+- VAD mode skips Piper clip synthesis entirely.
+- The repo currently trains and exports **ONNX**; the manifest can point at a future `.tflite`, but an ONNX→TFLite conversion / packaging step is still needed for direct ESPHome deployment.
+- `target_phrase` and `custom_negative_phrases` remain in the config only because openWakeWord expects standard knobs; in VAD mode they are effectively placeholders.
+- For VAD quality, data diversity matters more than synthetic phrase coverage.
 
 ## Pipeline Steps
 
