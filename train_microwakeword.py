@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""Train a Home Assistant Voice PE wake word or VAD model with microWakeWord."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import zipfile
+from pathlib import Path
+from typing import Callable
+
+import requests
+import yaml
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+THIRD_PARTY_DIR = SCRIPT_DIR / "third_party"
+MWW_DIR = THIRD_PARTY_DIR / "micro-wake-word"
+PIPER_MODELS_DIR = THIRD_PARTY_DIR / "piper-models"
+DATA_DIR = SCRIPT_DIR / "data"
+OUTPUT_DIR = SCRIPT_DIR / "output"
+EXPORT_DIR = SCRIPT_DIR / "export"
+DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
+
+CONFIG_FILE = DEFAULT_CONFIG
+
+NEGATIVE_FEATURE_ROOT = "https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main"
+DEFAULT_PIPER_MODEL_URL = (
+    "https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/"
+    "en_US-libritts_r-medium.pt"
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("train_microwakeword")
+
+
+def _run(cmd: list[str], cwd: Path | None = None) -> None:
+    log.info("$ %s", " ".join(cmd))
+    subprocess.check_call(cmd, cwd=str(cwd) if cwd else None)
+
+
+def _download(url: str, dest: Path, description: str, force: bool = False) -> None:
+    if dest.exists() and not force:
+        log.info("  Already present: %s", dest)
+        return
+
+    if force and dest.exists():
+        dest.unlink()
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    log.info("  Downloading %s", description)
+
+    with requests.get(url, stream=True, timeout=120) as response:
+        response.raise_for_status()
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with open(tmp, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    handle.write(chunk)
+        tmp.replace(dest)
+
+
+def _load_config(path: Path | None = None) -> dict:
+    with open(path or CONFIG_FILE, encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def _task(cfg: dict) -> str:
+    return str(cfg.get("task", "wakeword")).strip().lower()
+
+
+def _project_dir(cfg: dict) -> Path:
+    return OUTPUT_DIR / cfg["model_name"]
+
+
+def _generated_samples_dir(cfg: dict) -> Path:
+    return _project_dir(cfg) / "generated_samples"
+
+
+def _positive_features_dir(cfg: dict) -> Path:
+    return _project_dir(cfg) / "generated_augmented_features"
+
+
+def _negative_datasets_dir(cfg: dict) -> Path:
+    return _project_dir(cfg) / "negative_datasets"
+
+
+def _staged_positive_dir(cfg: dict) -> Path:
+    return _project_dir(cfg) / "staged_positive_audio"
+
+
+def _training_dir(cfg: dict) -> Path:
+    raw = cfg.get("training", {}).get("train_dir") or f"output/{cfg['model_name']}/trained_model"
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (SCRIPT_DIR / path).resolve()
+    return path
+
+
+def _resolve_path(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = (SCRIPT_DIR / path).resolve()
+    return path
+
+
+def _iter_audio_files(root: Path) -> list[Path]:
+    exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+    return [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in exts]
+
+
+def _check_micro_wake_word_import() -> bool:
+    try:
+        import microwakeword  # noqa: F401
+        import mmap_ninja  # noqa: F401
+        return True
+    except Exception as exc:
+        log.error("  microWakeWord dependencies are not installed: %s", exc)
+        log.error("  Run ./setup_environment.sh first.")
+        return False
+
+
+def _needs_piper(cfg: dict) -> bool:
+    return _task(cfg) == "wakeword" and not str(cfg.get("positive_dataset_path", "")).strip()
+
+
+def _ensure_piper_assets(cfg: dict) -> Path:
+    model_filename = cfg.get("piper_model_filename", "en_US-libritts_r-medium.pt")
+    model_url = cfg.get("piper_model_url", DEFAULT_PIPER_MODEL_URL)
+    model_path = PIPER_MODELS_DIR / model_filename
+    _download(model_url, model_path, f"Piper model {model_filename}")
+
+    for extra in cfg.get("piper_extra_downloads", []) or []:
+        if not isinstance(extra, dict) or "url" not in extra or "filename" not in extra:
+            raise ValueError("Each entry in piper_extra_downloads must have url and filename")
+        extra_path = PIPER_MODELS_DIR / str(extra["filename"])
+        _download(str(extra["url"]), extra_path, f"Piper asset {extra['filename']}")
+
+    return model_path
+
+
+def _link_or_copy(src: Path, dest: Path) -> None:
+    try:
+        os.link(src, dest)
+    except OSError:
+        shutil.copy2(src, dest)
+
+
+def _download_fleurs_dataset(dataset_cfg: dict) -> None:
+    import numpy as np
+    import soundfile as sf
+    from datasets import load_dataset
+
+    output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/fleurs_pl")))
+    max_clips = int(dataset_cfg.get("max_clips", 1200))
+    split = str(dataset_cfg.get("split", "train+validation"))
+    hf_config = str(dataset_cfg.get("hf_config", "pl_pl"))
+
+    if output_dir.exists() and any(output_dir.iterdir()):
+        log.info("  FLEURS dataset already present at %s", output_dir)
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = load_dataset("google/fleurs", hf_config, split=split, streaming=True)
+    count = 0
+    for row in dataset:
+        if count >= max_clips:
+            break
+        audio = row["audio"]
+        sf.write(
+            output_dir / f"fleurs_{count:06d}.wav",
+            np.asarray(audio["array"], dtype="float32"),
+            audio["sampling_rate"],
+        )
+        count += 1
+    log.info("  Saved %d FLEURS clips to %s", count, output_dir)
+
+
+def _download_bigos_dataset(dataset_cfg: dict) -> None:
+    import numpy as np
+    import soundfile as sf
+    from datasets import load_dataset
+
+    output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/bigos")))
+    max_clips = int(dataset_cfg.get("max_clips", 2000))
+    split = str(dataset_cfg.get("split", "train"))
+
+    if output_dir.exists() and any(output_dir.iterdir()):
+        log.info("  BIGOS dataset already present at %s", output_dir)
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = load_dataset("amu-cai/pl-asr-bigos-v2", split=split)
+    count = 0
+    for row in dataset:
+        if count >= max_clips:
+            break
+        audio = row["audio"]
+        sf.write(
+            output_dir / f"bigos_{count:06d}.wav",
+            np.asarray(audio["array"], dtype="float32"),
+            audio["sampling_rate"],
+        )
+        count += 1
+    log.info("  Saved %d BIGOS clips to %s", count, output_dir)
+
+
+def _bootstrap_positive_speech_datasets(cfg: dict) -> None:
+    for dataset_cfg in cfg.get("bootstrap_speech_datasets", []) or []:
+        kind = str(dataset_cfg.get("kind", "")).strip().lower()
+        enabled = bool(dataset_cfg.get("enabled", True))
+        optional = bool(dataset_cfg.get("optional", False))
+
+        if not enabled:
+            continue
+
+        try:
+            if kind == "fleurs":
+                _download_fleurs_dataset(dataset_cfg)
+            elif kind == "bigos":
+                _download_bigos_dataset(dataset_cfg)
+            else:
+                raise ValueError(f"Unsupported bootstrap dataset kind: {kind}")
+        except Exception as exc:
+            if optional:
+                log.warning("  Optional dataset bootstrap skipped for %s: %s", kind, exc)
+            else:
+                raise
+
+
+def _resolve_positive_sources(cfg: dict) -> list[Path]:
+    sources: list[Path] = []
+
+    if str(cfg.get("positive_dataset_path", "")).strip():
+        sources.append(_resolve_path(str(cfg["positive_dataset_path"])))
+
+    for item in cfg.get("positive_dataset_paths", []) or []:
+        if str(item).strip():
+            sources.append(_resolve_path(str(item)))
+
+    unique_sources: list[Path] = []
+    seen: set[str] = set()
+    for path in sources:
+        key = str(path)
+        if key not in seen:
+            unique_sources.append(path)
+            seen.add(key)
+    return unique_sources
+
+
+def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
+    staged_dir = _staged_positive_dir(cfg)
+    manifest_path = _project_dir(cfg) / "staged_positive_sources.json"
+    source_manifest = [str(path) for path in source_dirs]
+
+    if staged_dir.exists() and manifest_path.exists():
+        try:
+            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            current_manifest = None
+        if current_manifest == source_manifest and _iter_audio_files(staged_dir):
+            log.info("  Using staged positive audio at %s", staged_dir)
+            return staged_dir
+
+    if staged_dir.exists():
+        shutil.rmtree(staged_dir)
+    staged_dir.mkdir(parents=True, exist_ok=True)
+
+    index = 0
+    for source_dir in source_dirs:
+        files = _iter_audio_files(source_dir)
+        for audio_file in files:
+            dest = staged_dir / f"{source_dir.name}_{index:06d}{audio_file.suffix.lower()}"
+            _link_or_copy(audio_file, dest)
+            index += 1
+
+    if index == 0:
+        raise ValueError("No positive audio files were found in the configured source directories")
+
+    manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
+    log.info("  Staged %d positive audio files into %s", index, staged_dir)
+    return staged_dir
+
+
+def step_check_env() -> bool:
+    log.info("  Python: %s", sys.executable)
+    if sys.version_info < (3, 10):
+        log.error("  Python 3.10+ is required")
+        return False
+    return _check_micro_wake_word_import()
+
+
+def step_prepare_tools() -> bool:
+    if not MWW_DIR.exists():
+        log.error("  Missing micro-wake-word checkout at %s", MWW_DIR)
+        log.error("  Run ./setup_environment.sh first.")
+        return False
+
+    cfg = _load_config()
+    if not _needs_piper(cfg):
+        log.info("  Piper model not required for this config")
+        return True
+
+    try:
+        _ensure_piper_assets(cfg)
+        return True
+    except Exception as exc:
+        log.error("  Failed to prepare Piper assets: %s", exc)
+        return False
+
+
+def _download_mit_rirs(dest: Path) -> None:
+    import numpy as np
+    import soundfile as sf
+    from datasets import load_dataset
+
+    if dest.exists() and any(dest.iterdir()):
+        log.info("  MIT RIRs already present")
+        return
+
+    dest.mkdir(parents=True, exist_ok=True)
+    dataset = load_dataset(
+        "davidscripka/MIT_environmental_impulse_responses",
+        split="train",
+        streaming=True,
+        trust_remote_code=True,
+    )
+    count = 0
+    for row in dataset:
+        audio = row["audio"]
+        sf.write(
+            dest / f"rir_{count:04d}.wav",
+            np.asarray(audio["array"], dtype="float32"),
+            audio["sampling_rate"],
+        )
+        count += 1
+    log.info("  Saved %d RIR files", count)
+
+
+def _download_audioset_subset(dest: Path, limit: int = 300) -> None:
+    import numpy as np
+    import soundfile as sf
+    from datasets import load_dataset
+
+    if dest.exists() and any(dest.iterdir()):
+        log.info("  AudioSet subset already present")
+        return
+
+    dest.mkdir(parents=True, exist_ok=True)
+    dataset = load_dataset(
+        "agkphysics/AudioSet",
+        "unbalanced",
+        split="train",
+        streaming=True,
+        trust_remote_code=True,
+    )
+    count = 0
+    for row in dataset:
+        if count >= limit:
+            break
+        try:
+            audio = row["audio"]
+            sf.write(
+                dest / f"audioset_{count:04d}.wav",
+                np.asarray(audio["array"], dtype="float32"),
+                audio["sampling_rate"],
+            )
+            count += 1
+        except Exception:
+            continue
+    log.info("  Saved %d AudioSet clips", count)
+
+
+def _download_fma_subset(dest: Path, limit: int = 200) -> None:
+    import numpy as np
+    import soundfile as sf
+    from datasets import load_dataset
+
+    if dest.exists() and any(dest.iterdir()):
+        log.info("  FMA subset already present")
+        return
+
+    dest.mkdir(parents=True, exist_ok=True)
+    dataset = load_dataset(
+        "rudraml/fma",
+        name="small",
+        split="train",
+        streaming=True,
+        trust_remote_code=True,
+    )
+    count = 0
+    for row in dataset:
+        if count >= limit:
+            break
+        try:
+            audio = row["audio"]
+            sf.write(
+                dest / f"fma_{count:04d}.wav",
+                np.asarray(audio["array"], dtype="float32"),
+                audio["sampling_rate"],
+            )
+            count += 1
+        except Exception:
+            continue
+    log.info("  Saved %d FMA clips", count)
+
+
+def _download_negative_feature_pack(dest_root: Path, name: str) -> None:
+    target_dir = dest_root / name
+    if target_dir.exists() and any(target_dir.iterdir()):
+        log.info("  Negative feature pack already present: %s", name)
+        return
+
+    zip_path = dest_root / f"{name}.zip"
+    _download(
+        f"{NEGATIVE_FEATURE_ROOT}/{name}.zip",
+        zip_path,
+        f"negative feature pack {name}",
+    )
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(dest_root)
+    log.info("  Extracted negative feature pack: %s", name)
+
+
+def _negative_feature_names(cfg: dict) -> list[str]:
+    names = cfg.get("negative_feature_sets")
+    if names:
+        return [str(name) for name in names]
+    return ["speech", "dinner_party", "no_speech", "dinner_party_eval"]
+
+
+def step_download_assets() -> bool:
+    cfg = _load_config()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _download_mit_rirs(DATA_DIR / "mit_rirs")
+        _download_audioset_subset(DATA_DIR / "audioset_16k")
+        _download_fma_subset(DATA_DIR / "fma_16k")
+
+        neg_root = _negative_datasets_dir(cfg)
+        for name in _negative_feature_names(cfg):
+            _download_negative_feature_pack(neg_root, name)
+        return True
+    except Exception as exc:
+        log.error("  Asset download failed: %s", exc)
+        return False
+
+
+def _generate_piper_samples(cfg: dict) -> Path:
+    sample_dir = _generated_samples_dir(cfg)
+    if sample_dir.exists() and any(sample_dir.glob("*.wav")):
+        log.info("  Piper samples already present at %s", sample_dir)
+        return sample_dir
+
+    model_path = _ensure_piper_assets(cfg)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "piper_sample_generator",
+        str(cfg["sample_text"]),
+        "--model",
+        str(model_path),
+        "--max-samples",
+        str(cfg.get("generated_sample_count", 1000)),
+        "--batch-size",
+        str(cfg.get("generated_sample_batch_size", 100)),
+        "--output-dir",
+        str(sample_dir),
+    ]
+    for item in cfg.get("piper_extra_args", []) or []:
+        cmd.append(str(item))
+    _run(cmd)
+    return sample_dir
+
+
+def step_prepare_positives() -> bool:
+    cfg = _load_config()
+
+    try:
+        if _task(cfg) == "vad":
+            _bootstrap_positive_speech_datasets(cfg)
+
+        source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
+        if source_dirs:
+            total_files = sum(len(_iter_audio_files(path)) for path in source_dirs)
+            if total_files == 0:
+                log.error("  Positive source directories exist, but no audio files were found")
+                return False
+            if len(source_dirs) == 1:
+                log.info("  Using %d positive clips from %s", total_files, source_dirs[0])
+            else:
+                _stage_positive_sources(cfg, source_dirs)
+            return True
+
+        if _task(cfg) == "wakeword":
+            _generate_piper_samples(cfg)
+            return True
+
+        log.error("  No positive speech datasets are available for VAD training")
+        return False
+    except Exception as exc:
+        log.error("  Positive sample preparation failed: %s", exc)
+        return False
+
+
+def _positive_source(cfg: dict) -> tuple[Path, str]:
+    source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
+
+    if len(source_dirs) > 1:
+        return _stage_positive_sources(cfg, source_dirs), "*.*"
+    if len(source_dirs) == 1:
+        return source_dirs[0], str(cfg.get("positive_file_pattern", "**/*.wav"))
+
+    if _task(cfg) == "wakeword":
+        return _generated_samples_dir(cfg), "*.wav"
+
+    raise ValueError("No positive audio source is available")
+
+
+def step_generate_positive_features() -> bool:
+    if not _check_micro_wake_word_import():
+        return False
+
+    cfg = _load_config()
+    features_dir = _positive_features_dir(cfg)
+    training_mmap = features_dir / "training" / "wakeword_mmap"
+    if training_mmap.exists():
+        log.info("  Positive features already present at %s", training_mmap)
+        return True
+
+    from mmap_ninja.ragged import RaggedMmap
+    from microwakeword.audio.augmentation import Augmentation
+    from microwakeword.audio.clips import Clips
+    from microwakeword.audio.spectrograms import SpectrogramGeneration
+
+    positive_dir, file_pattern = _positive_source(cfg)
+    features_dir.mkdir(parents=True, exist_ok=True)
+
+    clips = Clips(
+        input_directory=str(positive_dir),
+        file_pattern=file_pattern,
+        max_clip_duration_s=None,
+        remove_silence=bool(cfg.get("remove_silence", False)),
+        random_split_seed=int(cfg.get("random_split_seed", 10)),
+        split_count=float(cfg.get("split_count", 0.1)),
+    )
+
+    aug_cfg = cfg.get("augmentation", {})
+    augmenter = Augmentation(
+        augmentation_duration_s=float(aug_cfg.get("duration_s", 3.2)),
+        augmentation_probabilities=aug_cfg.get("probabilities", {}),
+        impulse_paths=[str(DATA_DIR / "mit_rirs")],
+        background_paths=[str(DATA_DIR / "fma_16k"), str(DATA_DIR / "audioset_16k")],
+        background_min_snr_db=int(aug_cfg.get("background_min_snr_db", -5)),
+        background_max_snr_db=int(aug_cfg.get("background_max_snr_db", 10)),
+        min_jitter_s=float(aug_cfg.get("min_jitter_s", 0.195)),
+        max_jitter_s=float(aug_cfg.get("max_jitter_s", 0.205)),
+    )
+
+    for split in ("training", "validation", "testing"):
+        out_dir = features_dir / split
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        split_name = "train"
+        repetition = 2
+        slide_frames = 10
+        if split == "validation":
+            split_name = "validation"
+            repetition = 1
+        elif split == "testing":
+            split_name = "test"
+            repetition = 1
+            slide_frames = 1
+
+        spectrograms = SpectrogramGeneration(
+            clips=clips,
+            augmenter=augmenter,
+            slide_frames=slide_frames,
+            step_ms=10,
+        )
+
+        RaggedMmap.from_generator(
+            out_dir=str(out_dir / "wakeword_mmap"),
+            sample_generator=spectrograms.spectrogram_generator(
+                split=split_name,
+                repeat=repetition,
+            ),
+            batch_size=100,
+            verbose=True,
+        )
+
+    log.info("  Generated positive feature datasets at %s", features_dir)
+    return True
+
+
+def _write_training_config(cfg: dict) -> Path:
+    feature_root = _positive_features_dir(cfg)
+    neg_root = _negative_datasets_dir(cfg)
+    train_cfg = cfg.get("training", {})
+
+    negative_entries = []
+    weights = cfg.get("negative_feature_weights", {})
+    truncation = cfg.get("negative_feature_truncation", {})
+    for name in _negative_feature_names(cfg):
+        negative_entries.append(
+            {
+                "features_dir": str(neg_root / name),
+                "sampling_weight": float(weights.get(name, 10.0 if name != "dinner_party_eval" else 0.0)),
+                "penalty_weight": 1.0,
+                "truth": False,
+                "truncation_strategy": str(truncation.get(name, "split" if name == "dinner_party_eval" else "random")),
+                "type": "mmap",
+            }
+        )
+
+    config = {
+        "window_step_ms": 10,
+        "train_dir": str(_training_dir(cfg)),
+        "features": [
+            {
+                "features_dir": str(feature_root),
+                "sampling_weight": float(cfg.get("positive_sampling_weight", 2.0)),
+                "penalty_weight": 1.0,
+                "truth": True,
+                "truncation_strategy": str(cfg.get("positive_truncation_strategy", "truncate_start")),
+                "type": "mmap",
+            },
+            *negative_entries,
+        ],
+        "training_steps": train_cfg.get("training_steps", [10000]),
+        "positive_class_weight": train_cfg.get("positive_class_weight", [1]),
+        "negative_class_weight": train_cfg.get("negative_class_weight", [20]),
+        "learning_rates": train_cfg.get("learning_rates", [0.001]),
+        "batch_size": int(train_cfg.get("batch_size", 128)),
+        "time_mask_max_size": train_cfg.get("time_mask_max_size", [0]),
+        "time_mask_count": train_cfg.get("time_mask_count", [0]),
+        "freq_mask_max_size": train_cfg.get("freq_mask_max_size", [0]),
+        "freq_mask_count": train_cfg.get("freq_mask_count", [0]),
+        "eval_step_interval": int(train_cfg.get("eval_step_interval", 500)),
+        "clip_duration_ms": int(train_cfg.get("clip_duration_ms", 1500)),
+        "target_minimization": train_cfg.get("target_minimization", 0.9),
+        "minimization_metric": train_cfg.get("minimization_metric"),
+        "maximization_metric": train_cfg.get("maximization_metric", "average_viable_recall"),
+    }
+
+    out = _project_dir(cfg) / "training_parameters.yaml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as handle:
+        yaml.dump(config, handle, default_flow_style=False, sort_keys=False)
+    return out
+
+
+def step_train() -> bool:
+    if not _check_micro_wake_word_import():
+        return False
+
+    cfg = _load_config()
+    try:
+        training_config = _write_training_config(cfg)
+        cmd = [
+            sys.executable,
+            "-m",
+            "microwakeword.model_train_eval",
+            f"--training_config={training_config}",
+            "--train",
+            "1",
+            "--restore_checkpoint",
+            "1",
+            "--test_tf_nonstreaming",
+            "0",
+            "--test_tflite_nonstreaming",
+            "0",
+            "--test_tflite_nonstreaming_quantized",
+            "0",
+            "--test_tflite_streaming",
+            "0",
+            "--test_tflite_streaming_quantized",
+            "1",
+            "--use_weights",
+            "best_weights",
+            "mixednet",
+            "--pointwise_filters",
+            "64,64,64,64",
+            "--repeat_in_block",
+            "1,1,1,1",
+            "--mixconv_kernel_sizes",
+            "[5],[7,11],[9,15],[23]",
+            "--residual_connection",
+            "0,0,0,0",
+            "--first_conv_filters",
+            "32",
+            "--first_conv_kernel_size",
+            "5",
+            "--stride",
+            "3",
+        ]
+        _run(cmd)
+        return True
+    except subprocess.CalledProcessError as exc:
+        log.error("  Training failed with exit code %d", exc.returncode)
+        return False
+
+
+def step_export() -> bool:
+    cfg = _load_config()
+    train_dir = _training_dir(cfg)
+    source = train_dir / "tflite_stream_state_internal_quant" / "stream_state_internal_quant.tflite"
+    if not source.exists():
+        log.error("  Expected trained TFLite file not found: %s", source)
+        return False
+
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    dest_model = EXPORT_DIR / f"{cfg['model_name']}.tflite"
+    shutil.copy2(source, dest_model)
+
+    manifest_cfg = cfg.get("esphome_manifest", {})
+    manifest = {
+        "type": "micro",
+        "wake_word": cfg.get("wake_word", cfg["model_name"]),
+        "author": manifest_cfg.get("author", "ha-wakeword-trainer"),
+        "website": manifest_cfg.get("website", "https://github.com/lukcz/ha-wakeword-trainer"),
+        "model": dest_model.name,
+        "trained_languages": manifest_cfg.get("trained_languages", ["en"]),
+        "version": 2,
+        "micro": {
+            "probability_cutoff": float(manifest_cfg.get("probability_cutoff", 0.97)),
+            "feature_step_size": int(manifest_cfg.get("feature_step_size", 10)),
+            "sliding_window_size": int(manifest_cfg.get("sliding_window_size", 5)),
+            "tensor_arena_size": int(manifest_cfg.get("tensor_arena_size", 26080)),
+            "minimum_esphome_version": manifest_cfg.get("minimum_esphome_version", "2024.7.0"),
+        },
+    }
+    dest_manifest = EXPORT_DIR / f"{cfg['model_name']}.json"
+    dest_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    log.info("  Exported %s and %s", dest_model, dest_manifest)
+    return True
+
+
+STEPS: list[tuple[str, Callable[[], bool], str]] = [
+    ("check-env", step_check_env, "Verify Python and microWakeWord dependencies"),
+    ("prepare-tools", step_prepare_tools, "Verify microWakeWord and Piper tooling"),
+    ("download-assets", step_download_assets, "Download augmentation data and negative feature packs"),
+    ("prepare-positives", step_prepare_positives, "Prepare positive speech or wake-word samples"),
+    ("generate-positive-features", step_generate_positive_features, "Generate positive Ragged Mmap features"),
+    ("train", step_train, "Train and quantize the microWakeWord model"),
+    ("export", step_export, "Export the TFLite model and ESPHome manifest"),
+]
+STEP_NAMES = [name for name, _, _ in STEPS]
+
+
+def _print_steps() -> None:
+    print("\nAvailable steps:\n")
+    for index, (name, _, description) in enumerate(STEPS, 1):
+        print(f"  {index:2d}. {name:<28s} {description}")
+    print()
+
+
+def run_pipeline(from_step: str | None = None, single_step: str | None = None) -> bool:
+    if single_step:
+        matches = [(name, fn, desc) for name, fn, desc in STEPS if name == single_step]
+        if not matches:
+            log.error("Unknown step: %s", single_step)
+            _print_steps()
+            return False
+        name, fn, description = matches[0]
+        log.info("STEP: %s - %s", name, description)
+        return fn()
+
+    steps_to_run = STEPS
+    if from_step:
+        if from_step not in STEP_NAMES:
+            log.error("Unknown step: %s", from_step)
+            _print_steps()
+            return False
+        steps_to_run = STEPS[STEP_NAMES.index(from_step):]
+
+    total = len(steps_to_run)
+    for index, (name, fn, description) in enumerate(steps_to_run, 1):
+        log.info("")
+        log.info("=" * 60)
+        log.info("[%d/%d] %s - %s", index, total, name, description)
+        log.info("=" * 60)
+        if not fn():
+            log.error("[%d/%d] %s FAILED", index, total, name)
+            log.error("Pipeline stopped. Resume with:")
+            log.error("  python train_microwakeword.py --from %s", name)
+            return False
+        log.info("[%d/%d] %s PASSED", index, total, name)
+
+    log.info("All steps complete.")
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train a Home Assistant Voice PE wake word or VAD model with microWakeWord.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              python train_microwakeword.py
+              python train_microwakeword.py --config configs/microwakeword_example.yaml
+              python train_microwakeword.py --config configs/polish_vad.yaml
+              python train_microwakeword.py --step download-assets
+              python train_microwakeword.py --from train
+              python train_microwakeword.py --list-steps
+            """
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG),
+        help="Path to the microWakeWord training config YAML.",
+    )
+    parser.add_argument("--step", default=None, help="Run a single step.")
+    parser.add_argument("--from", dest="from_step", default=None, help="Resume from a step.")
+    parser.add_argument("--list-steps", action="store_true", help="Print the step list and exit.")
+    args = parser.parse_args()
+
+    if args.list_steps:
+        _print_steps()
+        return
+
+    global CONFIG_FILE
+    CONFIG_FILE = Path(args.config).resolve()
+
+    ok = run_pipeline(from_step=args.from_step, single_step=args.step)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

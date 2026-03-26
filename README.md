@@ -1,184 +1,92 @@
 # ha-wakeword-trainer
 
-Repo do prostego uruchamiania treningu na Linuxie / WSL2 bez ręcznego składania środowiska i bez ręcznego kompletowania wszystkich datasetów na start.
+This repository is now organized around two local training flows for Home Assistant Voice PE:
 
-Obecnie repo ma dwa tryby:
+- `wakeword`: train a custom wake word with the official [microWakeWord](https://github.com/OHF-Voice/micro-wake-word) stack
+- `vad`: train a custom speech detector for Polish or other languages, also using a local microWakeWord-based pipeline
 
-- `vad`: trening klasyfikatora mowa vs brak mowy
-- `wakeword`: trening modelu wake word
+The repository still includes a helper to download the official ESPHome VAD model, but that is no longer the default path.
 
-Całość jest spięta przez:
-
-- `setup_environment.sh` - instaluje systemowe zależności, klonuje repo jeśli trzeba i tworzy `.venv`
-- `train.sh` - prosty launcher do uruchomienia treningu
-- `train_vad_full.sh` - preset do pełnego VAD
-- `train_wakeword_full.sh` - preset do pełnego wake word
-- `train_wakeword.py` - pipeline krok po kroku
-
-## Szybki start przez `wget`
-
-Jeśli chcesz zacząć od zera na WSL2 / Linux:
+## Quick Start
 
 ```bash
 wget -O setup_environment.sh https://raw.githubusercontent.com/lukcz/ha-wakeword-trainer/main/setup_environment.sh
 chmod +x setup_environment.sh
 ./setup_environment.sh
+cd ~/ha-wakeword-trainer
 ```
 
-Po setupie:
+## Train A Wake Word
 
 ```bash
-cd ~/ha-wakeword-trainer
-./train.sh vad
-```
-
-Albo jeszcze krócej:
-
-```bash
-cd ~/ha-wakeword-trainer
-./train_vad_full.sh
-```
-
-Albo dla wake word:
-
-```bash
-cd ~/ha-wakeword-trainer
-./train.sh wakeword
-```
-
-Albo:
-
-```bash
-cd ~/ha-wakeword-trainer
 ./train_wakeword_full.sh
 ```
 
-## Co repo robi samo
+This uses `configs/microwakeword_example.yaml` by default.
 
-- instaluje `ffmpeg`, `python3`, `git`, `wget`, `venv`
-- tworzy lokalne środowisko `.venv`
-- instaluje paczki z `requirements.txt`
-- pobiera dane tła i walidacyjne potrzebne do treningu
-- dla VAD:
-  - jeśli brakuje `bigos`, pipeline próbuje pobrać prawdziwy BIGOS, potem publiczny polski FLEURS, a na końcu fallback speech przez `edge-tts`
-  - jeśli brakuje `no_speech`, pipeline generuje zestaw room tone / hum / silence-like WAV
-  - jeśli brakuje `dinner_party`, pipeline generuje gęste tło typu crowd/babble z miksu mowy i ambientu
-  - jeśli nie ma innych negatywnych danych, pipeline nadal pobiera publiczne subsety tła / muzyki / noise
-
-To oznacza, że `./train.sh vad` powinno wystartować bez ręcznego wrzucania datasetów, także gdy w configu są `bigos`, `no_speech` i `dinner_party`. Własne dane nadal są lepsze, ale repo nie blokuje się już na pustym `data/`.
-
-## Najprostsze komendy
-
-Pełny trening VAD:
+To train your own wake word config:
 
 ```bash
-./train.sh vad
+cp configs/microwakeword_example.yaml configs/my_model.yaml
+./train.sh wakeword --config configs/my_model.yaml
 ```
 
-Pełny trening wake word:
+## Train A Custom VAD
 
 ```bash
-./train.sh wakeword
+./train_vad_full.sh
 ```
 
-Wznowienie od wybranego kroku:
+This uses `configs/polish_vad.yaml` by default.
+
+The VAD flow:
+
+1. downloads augmentation assets
+2. downloads official negative feature packs used by microWakeWord
+3. bootstraps positive speech data for Polish
+4. prepares positive speech features
+5. trains a custom model
+6. exports `.tflite` and `.json` for ESPHome
+
+By default the bootstrap tries:
+
+- `amu-cai/pl-asr-bigos-v2` if you have access
+- `google/fleurs` for `pl_pl`
+- any local datasets you place in `data/mc_speech` or `data/pl_speech`
+
+So the repository can still start without a fully manual dataset setup, but real recordings remain better.
+
+## Fetch The Official VAD Anyway
+
+If you want the stock ESPHome model for comparison:
 
 ```bash
-./train.sh vad --from augment
+./train.sh vad-official
 ```
 
-Lista kroków pipeline:
+Or:
 
 ```bash
-python train_wakeword.py --list-steps
+python fetch_voice_pe_vad.py --model vad
 ```
 
-## Własne dane do VAD
+## Main Files
 
-Domyślna konfiguracja to [configs/polish_vad.yaml](/D:/Github/ha-wakeword-trainer/configs/polish_vad.yaml).
+- `setup_environment.sh`: Linux and WSL2 bootstrap
+- `train.sh`: main launcher
+- `train_microwakeword.py`: local training pipeline for wake word and VAD
+- `fetch_voice_pe_vad.py`: official model downloader
+- `configs/microwakeword_example.yaml`: example wake-word config
+- `configs/polish_vad.yaml`: example Polish VAD config
 
-Jeśli masz własne datasety, możesz je podpiąć bez edycji pliku YAML:
+## Notes
 
-```bash
-./train.sh vad \
-  --positive-datasets mc_speech,bigos \
-  --negative-datasets no_speech,dinner_party,musan,fma \
-  --dataset-path mc_speech=/data/polish/mc_speech \
-  --dataset-path bigos=/data/polish/bigos \
-  --dataset-path no_speech=/data/no_speech
-```
+- For wake words, real recordings are usually much better than pure TTS.
+- For Polish VAD, local speech datasets are strongly recommended even if the bootstrap fallback is enabled.
+- Generated files are written to `export/`.
 
-Pozytywne dane:
+## Upstream References
 
-- ludzka mowa
-- wielu mówców
-- różne mikrofony i pokoje
-
-Negatywne dane:
-
-- cisza
-- szum tła
-- HVAC
-- muzyka
-- ambient
-
-## Własny wake word
-
-Przykładowa konfiguracja jest w [configs/wakeword_example.yaml](/D:/Github/ha-wakeword-trainer/configs/wakeword_example.yaml).
-
-Najprościej:
-
-```bash
-cp configs/wakeword_example.yaml configs/moj_wakeword.yaml
-```
-
-Potem zmień:
-
-- `model_name`
-- `target_phrase`
-- `custom_negative_phrases`
-
-I uruchom:
-
-```bash
-./train.sh wakeword --config configs/moj_wakeword.yaml
-```
-
-## Gdzie są wyniki
-
-Pipeline zapisuje artefakty do:
-
-- `output/` - pliki pośrednie
-- `export/` - gotowe modele do użycia
-
-W repo są też przykładowe gotowe artefakty:
-
-- `hej_zgredek.tflite`
-- `hej_zgredek.json`
-
-To są przykładowe pliki wynikowe, nie wejście do treningu.
-
-## Najważniejsze pliki
-
-- [train.sh](/D:/Github/ha-wakeword-trainer/train.sh) - najprostszy punkt wejścia
-- [train_vad_full.sh](/D:/Github/ha-wakeword-trainer/train_vad_full.sh) - pełny preset VAD
-- [train_wakeword_full.sh](/D:/Github/ha-wakeword-trainer/train_wakeword_full.sh) - pełny preset wake word
-- [setup_environment.sh](/D:/Github/ha-wakeword-trainer/setup_environment.sh) - bootstrap na WSL2 / Linux
-- [train_wakeword.py](/D:/Github/ha-wakeword-trainer/train_wakeword.py) - pipeline
-- [configs/polish_vad.yaml](/D:/Github/ha-wakeword-trainer/configs/polish_vad.yaml) - VAD
-- [configs/wakeword_example.yaml](/D:/Github/ha-wakeword-trainer/configs/wakeword_example.yaml) - wake word
-
-## Typowy flow
-
-1. Uruchamiasz `./setup_environment.sh` albo pobierasz go przez `wget`.
-2. Wchodzisz do repo.
-3. Startujesz `./train.sh vad` albo `./train.sh wakeword`.
-4. Jeśli pipeline padnie, wznawiasz od kroku `--from ...`.
-5. Gotowy model bierzesz z `export/`.
-
-## Uwagi praktyczne
-
-- Trening najlepiej odpalać w Linuxie / WSL2, nie natywnie z PowerShell.
-- Pierwsze uruchomienie może pobrać kilka GB danych.
-- Fallback speech dla VAD jest wygodny, ale jakość końcowego modelu będzie lepsza na prawdziwych nagraniach.
-- Jeśli chcesz tylko sprawdzić stan pipeline, użyj `--verify-only`.
+- microWakeWord: [OHF-Voice/micro-wake-word](https://github.com/OHF-Voice/micro-wake-word)
+- official ESPHome models: [esphome/micro-wake-word-models](https://github.com/esphome/micro-wake-word-models)
+- Voice PE firmware: [esphome/home-assistant-voice-pe](https://github.com/esphome/home-assistant-voice-pe)

@@ -1,0 +1,61 @@
+model_name: "hej_zgredek"
+wake_word: "Hej Zgredek"
+
+# If you have real recordings of the target phrase, put them in a directory and
+# set positive_dataset_path. This is usually better than pure TTS generation.
+positive_dataset_path: ""
+positive_file_pattern: "**/*.wav"
+
+# If positive_dataset_path is empty, Piper sample generator is used.
+# For custom languages you will likely want to change both the model URL and the
+# sample_text / phonetic spelling.
+sample_text: "hej zgredek"
+generated_sample_count: 1000
+generated_sample_batch_size: 100
+piper_model_url: "https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt"
+piper_model_filename: "en_US-libritts_r-medium.pt"
+piper_extra_args: []
+
+augmentation:
+  duration_s: 3.2
+  background_min_snr_db: -5
+  background_max_snr_db: 10
+  min_jitter_s: 0.195
+  max_jitter_s: 0.205
+  probabilities:
+    SevenBandParametricEQ: 0.1
+    TanhDistortion: 0.1
+    PitchShift: 0.1
+    BandStopFilter: 0.1
+    AddColorNoise: 0.1
+    AddBackgroundNoise: 0.75
+    Gain: 1.0
+    GainTransition: 0.25
+    RIR: 0.5
+
+training:
+  train_dir: "output/hej_zgredek/trained_model"
+  training_steps: [10000]
+  learning_rates: [0.001]
+  positive_class_weight: [1]
+  negative_class_weight: [20]
+  batch_size: 128
+  eval_step_interval: 500
+  clip_duration_ms: 1500
+  minimization_metric: null
+  target_minimization: 0.9
+  maximization_metric: "average_viable_recall"
+  time_mask_max_size: [0]
+  time_mask_count: [0]
+  freq_mask_max_size: [0]
+  freq_mask_count: [0]
+
+esphome_manifest:
+  probability_cutoff: 0.97
+  sliding_window_size: 5
+  tensor_arena_size: 26080
+  feature_step_size: 10
+  minimum_esphome_version: "2024.7.0"
+  trained_languages: ["pl"]
+  author: "ha-wakeword-trainer"
+  website: "https://github.com/lukcz/ha-wakeword-trainer"

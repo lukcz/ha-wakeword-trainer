@@ -11,20 +11,23 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-MODE="${1:-vad}"
+MODE="${1:-wakeword}"
 if [[ $# -gt 0 ]]; then
   shift
 fi
 
 case "$MODE" in
-  vad)
-    exec python "$SCRIPT_DIR/train_wakeword.py" --config "$SCRIPT_DIR/configs/polish_vad.yaml" "$@"
-    ;;
   wakeword)
-    exec python "$SCRIPT_DIR/train_wakeword.py" --config "$SCRIPT_DIR/configs/wakeword_example.yaml" "$@"
+    exec python "$SCRIPT_DIR/train_microwakeword.py" --config "$SCRIPT_DIR/configs/microwakeword_example.yaml" "$@"
+    ;;
+  vad)
+    exec python "$SCRIPT_DIR/train_microwakeword.py" --config "$SCRIPT_DIR/configs/polish_vad.yaml" "$@"
+    ;;
+  vad-official)
+    exec python "$SCRIPT_DIR/fetch_voice_pe_vad.py" "$@"
     ;;
   *)
-    printf 'Usage: %s [vad|wakeword] [extra train_wakeword.py args]\n' "$0" >&2
+    printf 'Usage: %s [wakeword|vad|vad-official] [extra args]\n' "$0" >&2
     exit 1
     ;;
 esac

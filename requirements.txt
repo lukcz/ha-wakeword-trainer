@@ -1,33 +1,9 @@
-# Wake Word Trainer Requirements
-# Install with: pip install -r requirements.txt
+# Helper dependencies for the local orchestration scripts in this repository.
+# The actual training stack is installed from the official microWakeWord repo
+# in setup_environment.sh.
 
-# TTS sample generation
-edge-tts>=6.0.0
-
-# Data handling
 datasets>=2.21.0,<3.0.0
-huggingface_hub>=0.20.0
-soundfile>=0.12.0
-librosa>=0.10.0
-scipy>=1.10.0
-
-# Configuration
-pyyaml>=6.0
-requests>=2.28.0
-tqdm>=4.65.0
-
-# NumPy 2.x is required by nanowakeword 2.x.
-numpy>=2.0.0,<3.0.0
-
-# PyArrow 16.x works with NumPy 2.x and has Linux wheels for Python 3.12.
-pyarrow>=16.1.0,<17.0.0
-
-# mmap for feature storage
-mmap-ninja>=0.8.0
-
-# Audio processing
-webrtcvad>=2.0.10
-audioread>=3.0.0
-
-# Training backend used by oww_wrapper.py
-nanowakeword[train]>=2.0.2,<2.1
+mmap-ninja>=0.8.0,<1.0.0
+pyyaml>=6.0,<7.0
+requests>=2.32.0,<3.0.0
+soundfile>=0.12.1,<1.0.0

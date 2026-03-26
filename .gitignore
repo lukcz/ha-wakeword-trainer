@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.part
+
+data/
+export/
+output/
+third_party/
+
+.ipynb_checkpoints/
