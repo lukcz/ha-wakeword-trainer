@@ -119,6 +119,28 @@ def _iter_audio_files(root: Path) -> list[Path]:
     return [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in exts]
 
 
+def _safe_iter_audio_files(root: Path) -> list[Path]:
+    try:
+        return _iter_audio_files(root)
+    except OSError as exc:
+        log.warning("  Failed to scan audio files in %s: %s", root, exc)
+        return []
+
+
+def _dir_has_entries(path: Path) -> bool:
+    try:
+        return path.exists() and any(path.iterdir())
+    except OSError as exc:
+        log.warning("  Directory check failed for %s: %s", path, exc)
+        return False
+
+
+def _reset_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+
+
 def _check_micro_wake_word_import() -> bool:
     try:
         import microwakeword  # noqa: F401
@@ -221,11 +243,11 @@ def _download_fleurs_dataset(dataset_cfg: dict) -> None:
     hf_config = str(dataset_cfg.get("hf_config", "pl_pl"))
     io_workers = _resolve_io_workers(dataset_cfg)
 
-    if output_dir.exists() and any(output_dir.iterdir()):
+    if _dir_has_entries(output_dir):
         log.info("  FLEURS dataset already present at %s", output_dir)
         return
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _reset_dir(output_dir)
     count = 0
     for split_name in _split_spec_parts(split):
         if count >= max_clips:
@@ -250,17 +272,27 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
     hf_config = str(dataset_cfg.get("hf_config", "all"))
     io_workers = _resolve_io_workers(dataset_cfg)
 
-    if output_dir.exists() and any(output_dir.iterdir()):
+    if _dir_has_entries(output_dir):
         log.info("  BIGOS dataset already present at %s", output_dir)
         return
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dataset = load_dataset(
-        "amu-cai/pl-asr-bigos-v2",
-        hf_config,
-        split=split,
-        trust_remote_code=True,
-    )
+    _reset_dir(output_dir)
+    try:
+        dataset = load_dataset(
+            "amu-cai/pl-asr-bigos-v2",
+            hf_config,
+            split=split,
+            streaming=True,
+            trust_remote_code=True,
+        )
+    except Exception:
+        dataset = load_dataset(
+            "amu-cai/pl-asr-bigos-v2",
+            hf_config,
+            split=split,
+            streaming=False,
+            trust_remote_code=True,
+        )
     count = _write_dataset_audio(dataset, output_dir, "bigos", max_clips, io_workers)
     log.info("  Saved %d BIGOS clips to %s", count, output_dir)
 
@@ -318,7 +350,7 @@ def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
             current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             current_manifest = None
-        if current_manifest == source_manifest and _iter_audio_files(staged_dir):
+        if current_manifest == source_manifest and _safe_iter_audio_files(staged_dir):
             log.info("  Using staged positive audio at %s", staged_dir)
             return staged_dir
 
@@ -328,7 +360,7 @@ def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
 
     index = 0
     for source_dir in source_dirs:
-        files = _iter_audio_files(source_dir)
+        files = _safe_iter_audio_files(source_dir)
         for audio_file in files:
             dest = staged_dir / f"{source_dir.name}_{index:06d}{audio_file.suffix.lower()}"
             _link_or_copy(audio_file, dest)
@@ -533,7 +565,7 @@ def step_prepare_positives() -> bool:
 
         source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
         if source_dirs:
-            total_files = sum(len(_iter_audio_files(path)) for path in source_dirs)
+            total_files = sum(len(_safe_iter_audio_files(path)) for path in source_dirs)
             if total_files == 0:
                 log.error("  Positive source directories exist, but no audio files were found")
                 return False
