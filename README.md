@@ -56,6 +56,13 @@ The VAD flow:
 5. trains a custom model
 6. exports `.tflite` and `.json` for ESPHome
 
+If you already created `.venv` before a dependency fix landed, refresh the helper packages with:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
 By default the bootstrap tries:
 
 - `amu-cai/pl-asr-bigos-v2` if you have access
