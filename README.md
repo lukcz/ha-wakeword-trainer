@@ -43,6 +43,7 @@ Alternative Polish VAD presets:
 
 - `configs/polish_vad_balanced.yaml`: less conservative than the default, better balance of recall vs false activations
 - `configs/polish_vad_high_recall.yaml`: pushes recall harder, useful if the detector misses too much speech
+- `configs/polish_vad_low_fp.yaml`: prioritizes reducing ambient false positives, even if recall drops a bit
 - both presets also use a larger batch size and CPU thread hints for better throughput on 8-core desktop CPUs
 
 Examples:
@@ -50,6 +51,7 @@ Examples:
 ```bash
 python train_microwakeword.py --config configs/polish_vad_balanced.yaml
 python train_microwakeword.py --config configs/polish_vad_high_recall.yaml
+python train_microwakeword.py --config configs/polish_vad_low_fp.yaml
 python train_microwakeword.py --config configs/polish_vad_balanced.yaml --step audit-validation
 ```
 
