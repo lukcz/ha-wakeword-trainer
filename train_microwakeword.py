@@ -132,6 +132,23 @@ def _as_numpy(value):
     return True
 
 
+def _patch_microwakeword_test_py() -> bool:
+    test_py = MWW_DIR / "microwakeword" / "test.py"
+    if not test_py.exists():
+        log.error("  microWakeWord test module not found at %s", test_py)
+        return False
+
+    original = test_py.read_text(encoding="utf-8")
+    updated = original.replace("np.trapz(", "np.trapezoid(")
+
+    if updated == original:
+        return True
+
+    test_py.write_text(updated, encoding="utf-8")
+    log.info("  Patched microWakeWord test compatibility in %s", test_py)
+    return True
+
+
 def _load_config(path: Path | None = None) -> dict:
     with open(path or CONFIG_FILE, encoding="utf-8") as handle:
         return yaml.safe_load(handle)
@@ -1060,6 +1077,8 @@ def step_train() -> bool:
     if not _ensure_python_module("tensorboard", TENSORBOARD_PIP_SPEC):
         return False
     if not _patch_microwakeword_train_py():
+        return False
+    if not _patch_microwakeword_test_py():
         return False
 
     cfg = _load_config()
