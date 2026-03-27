@@ -606,12 +606,34 @@ def _download_fma_subset(dest: Path, limit: int = 200, io_workers: int = 4) -> N
 
 
 def _download_negative_feature_pack(dest_root: Path, name: str) -> None:
-    target_dir = dest_root / name
-    if target_dir.exists() and any(target_dir.iterdir()):
-        log.info("  Negative feature pack already present: %s", name)
-        return
+    from mmap_ninja.ragged import RaggedMmap
 
+    def validate_pack(pack_dir: Path) -> tuple[bool, str | None]:
+        mmap_dirs = [path for path in pack_dir.glob("**/*_mmap") if path.is_dir()]
+        if not mmap_dirs:
+            return False, "no mmap directories found"
+
+        for mmap_dir in mmap_dirs:
+            try:
+                RaggedMmap(str(mmap_dir))
+            except Exception as exc:
+                return False, f"{mmap_dir}: {exc}"
+
+        return True, None
+
+    target_dir = dest_root / name
     zip_path = dest_root / f"{name}.zip"
+    if target_dir.exists() and any(target_dir.iterdir()):
+        valid, reason = validate_pack(target_dir)
+        if valid:
+            log.info("  Negative feature pack already present: %s", name)
+            return
+
+        log.warning("  Negative feature pack %s is corrupted (%s). Re-downloading.", name, reason)
+        shutil.rmtree(target_dir, ignore_errors=True)
+        if zip_path.exists():
+            zip_path.unlink()
+
     _download(
         f"{NEGATIVE_FEATURE_ROOT}/{name}.zip",
         zip_path,
@@ -620,6 +642,11 @@ def _download_negative_feature_pack(dest_root: Path, name: str) -> None:
     dest_root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as archive:
         archive.extractall(dest_root)
+
+    valid, reason = validate_pack(target_dir)
+    if not valid:
+        raise ValueError(f"negative feature pack {name} is still invalid after download: {reason}")
+
     log.info("  Extracted negative feature pack: %s", name)
 
 
@@ -1037,6 +1064,10 @@ def step_train() -> bool:
 
     cfg = _load_config()
     try:
+        neg_root = _negative_datasets_dir(cfg)
+        for name in _negative_feature_names(cfg):
+            _download_negative_feature_pack(neg_root, name)
+
         training_config = _write_training_config(cfg)
         cmd = [
             sys.executable,
