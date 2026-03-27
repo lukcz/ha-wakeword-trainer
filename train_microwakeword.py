@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -52,7 +53,13 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = N
     subprocess.check_call(cmd, cwd=str(cwd) if cwd else None, env=env)
 
 
-def _download(url: str, dest: Path, description: str, force: bool = False) -> None:
+def _download(
+    url: str,
+    dest: Path,
+    description: str,
+    force: bool = False,
+    retries: int = 5,
+) -> None:
     if dest.exists() and not force:
         log.info("  Already present: %s", dest)
         return
@@ -61,16 +68,36 @@ def _download(url: str, dest: Path, description: str, force: bool = False) -> No
         dest.unlink()
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    log.info("  Downloading %s", description)
+    tmp = dest.with_suffix(dest.suffix + ".part")
 
-    with requests.get(url, stream=True, timeout=120) as response:
-        response.raise_for_status()
-        tmp = dest.with_suffix(dest.suffix + ".part")
-        with open(tmp, "wb") as handle:
-            for chunk in response.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    handle.write(chunk)
-        tmp.replace(dest)
+    for attempt in range(1, retries + 1):
+        if tmp.exists():
+            tmp.unlink()
+
+        log.info("  Downloading %s (attempt %d/%d)", description, attempt, retries)
+        try:
+            with requests.get(url, stream=True, timeout=120) as response:
+                response.raise_for_status()
+                with open(tmp, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            handle.write(chunk)
+            tmp.replace(dest)
+            return
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            retryable = status in {408, 409, 425, 429, 500, 502, 503, 504}
+            if attempt >= retries or not retryable:
+                raise
+            sleep_s = min(60, 2 ** (attempt - 1))
+            log.warning("  Temporary HTTP failure while downloading %s: %s. Retrying in %ss.", description, exc, sleep_s)
+            time.sleep(sleep_s)
+        except requests.RequestException as exc:
+            if attempt >= retries:
+                raise
+            sleep_s = min(60, 2 ** (attempt - 1))
+            log.warning("  Temporary network failure while downloading %s: %s. Retrying in %ss.", description, exc, sleep_s)
+            time.sleep(sleep_s)
 
 
 def _ensure_python_module(module_name: str, pip_requirement: str) -> bool:
