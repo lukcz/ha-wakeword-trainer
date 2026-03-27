@@ -50,6 +50,7 @@ Examples:
 ```bash
 python train_microwakeword.py --config configs/polish_vad_balanced.yaml
 python train_microwakeword.py --config configs/polish_vad_high_recall.yaml
+python train_microwakeword.py --config configs/polish_vad_balanced.yaml --step audit-validation
 ```
 
 You can tune the locally downloaded ambient subsets in that config:

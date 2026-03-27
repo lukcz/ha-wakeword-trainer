@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import logging
@@ -732,6 +733,165 @@ def _positive_source(cfg: dict) -> tuple[Path, str]:
     raise ValueError("No positive audio source is available")
 
 
+def _clip_entry_path(entry: dict) -> str:
+    audio = entry.get("audio")
+    if isinstance(audio, dict):
+        for key in ("path", "filename"):
+            value = audio.get(key)
+            if value:
+                return str(value)
+    return str(audio)
+
+
+def _hash_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _intersection_size(left: set[str], right: set[str]) -> int:
+    return len(left.intersection(right))
+
+
+def step_audit_validation() -> bool:
+    if not _check_micro_wake_word_import():
+        return False
+
+    cfg = _load_config()
+    try:
+        from mmap_ninja.ragged import RaggedMmap
+        from microwakeword.audio.clips import Clips
+    except Exception as exc:
+        log.error("  Audit dependencies are not available: %s", exc)
+        return False
+
+    try:
+        positive_dir, file_pattern = _positive_source(cfg)
+    except Exception as exc:
+        log.error("  Could not resolve positive source for audit: %s", exc)
+        return False
+
+    try:
+        clips = Clips(
+            input_directory=str(positive_dir),
+            file_pattern=file_pattern,
+            max_clip_duration_s=None,
+            remove_silence=bool(cfg.get("remove_silence", False)),
+            random_split_seed=int(cfg.get("random_split_seed", 10)),
+            split_count=float(cfg.get("split_count", 0.1)),
+        )
+    except Exception as exc:
+        log.error("  Failed to build clip splits for audit: %s", exc)
+        return False
+
+    if not hasattr(clips, "split_clips"):
+        log.error("  Clips object did not expose split datasets; random_split_seed may be missing.")
+        return False
+
+    split_paths: dict[str, list[str]] = {}
+    split_hashes: dict[str, set[str]] = {}
+    for split_name in ("train", "validation", "test"):
+        dataset = clips.split_clips[split_name]
+        paths = [_clip_entry_path(entry) for entry in dataset]
+        split_paths[split_name] = paths
+
+        hashes: set[str] = set()
+        for path_str in paths:
+            path = Path(path_str)
+            if path.exists():
+                try:
+                    hashes.add(_hash_file(path))
+                except OSError as exc:
+                    log.warning("  Could not hash %s: %s", path, exc)
+        split_hashes[split_name] = hashes
+
+    log.info("  Positive split sizes:")
+    for split_name in ("train", "validation", "test"):
+        log.info("    %-10s %6d clips", split_name, len(split_paths[split_name]))
+
+    path_overlaps = {
+        "train/validation": _intersection_size(set(split_paths["train"]), set(split_paths["validation"])),
+        "train/test": _intersection_size(set(split_paths["train"]), set(split_paths["test"])),
+        "validation/test": _intersection_size(set(split_paths["validation"]), set(split_paths["test"])),
+    }
+    hash_overlaps = {
+        "train/validation": _intersection_size(split_hashes["train"], split_hashes["validation"]),
+        "train/test": _intersection_size(split_hashes["train"], split_hashes["test"]),
+        "validation/test": _intersection_size(split_hashes["validation"], split_hashes["test"]),
+    }
+
+    log.info("  Exact path overlaps between positive splits:")
+    for label, count in path_overlaps.items():
+        log.info("    %-18s %d", label, count)
+
+    log.info("  Content-hash overlaps between positive splits:")
+    for label, count in hash_overlaps.items():
+        log.info("    %-18s %d", label, count)
+
+    neg_root = _negative_datasets_dir(cfg)
+    log.info("  Negative feature pack ambient stats:")
+    found_any = False
+    for name in _negative_feature_names(cfg):
+        feature_dir = neg_root / name
+        validation_ambient_dir = feature_dir / "validation_ambient"
+        validation_dir = feature_dir / "validation"
+        training_dir = feature_dir / "training"
+        testing_ambient_dir = feature_dir / "testing_ambient"
+
+        counts = {
+            "training": 0,
+            "validation": 0,
+            "validation_ambient": 0,
+            "testing_ambient": 0,
+        }
+
+        for label, directory in (
+            ("training", training_dir),
+            ("validation", validation_dir),
+            ("validation_ambient", validation_ambient_dir),
+            ("testing_ambient", testing_ambient_dir),
+        ):
+            if not directory.exists():
+                continue
+            for mmap_path in directory.glob("**/*_mmap/"):
+                try:
+                    counts[label] += len(RaggedMmap(str(mmap_path)))
+                except Exception as exc:
+                    log.warning("  Could not inspect %s: %s", mmap_path, exc)
+
+        if any(counts.values()):
+            found_any = True
+            log.info(
+                "    %-18s training=%d validation=%d validation_ambient=%d testing_ambient=%d",
+                name,
+                counts["training"],
+                counts["validation"],
+                counts["validation_ambient"],
+                counts["testing_ambient"],
+            )
+
+    if not found_any:
+        log.warning("  No negative feature pack stats were found under %s", neg_root)
+
+    suspicious = []
+    if any(path_overlaps.values()):
+        suspicious.append("exact path overlap between positive splits")
+    if any(hash_overlaps.values()):
+        suspicious.append("content-duplicate overlap between positive splits")
+
+    if suspicious:
+        log.warning("  Audit found suspicious validation issues: %s", ", ".join(suspicious))
+    else:
+        log.info("  Audit found no overlap between positive splits.")
+
+    return True
+
+
 def step_generate_positive_features() -> bool:
     if not _check_micro_wake_word_import():
         return False
@@ -987,6 +1147,7 @@ STEPS: list[tuple[str, Callable[[], bool], str]] = [
     ("download-assets", step_download_assets, "Download augmentation data and negative feature packs"),
     ("prepare-positives", step_prepare_positives, "Prepare positive speech or wake-word samples"),
     ("generate-positive-features", step_generate_positive_features, "Generate positive Ragged Mmap features"),
+    ("audit-validation", step_audit_validation, "Audit split integrity and ambient validation data"),
     ("train", step_train, "Train and quantize the microWakeWord model"),
     ("export", step_export, "Export the TFLite model and ESPHome manifest"),
 ]
