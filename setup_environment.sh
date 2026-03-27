@@ -117,6 +117,9 @@ main() {
   log "Installing Piper sample generator"
   python -m pip install "$PIPER_PACKAGE"
 
+  log "Reinstalling a recent audiomentations for microWakeWord compatibility"
+  python -m pip install --upgrade "audiomentations>=0.43.0,<1.0.0"
+
   log "Environment is ready"
   printf '\n'
   printf 'Next steps:\n'

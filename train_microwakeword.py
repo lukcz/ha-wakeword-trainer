@@ -141,6 +141,29 @@ def _reset_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _resolve_augmentation_probabilities(raw_probabilities: dict) -> dict:
+    try:
+        import audiomentations
+    except Exception:
+        return dict(raw_probabilities)
+
+    resolved = {}
+    missing = []
+    for name, probability in (raw_probabilities or {}).items():
+        if hasattr(audiomentations, name):
+            resolved[name] = probability
+        else:
+            missing.append(name)
+
+    if missing:
+        log.warning(
+            "  Skipping unsupported audiomentations transforms: %s",
+            ", ".join(sorted(missing)),
+        )
+
+    return resolved
+
+
 def _check_micro_wake_word_import() -> bool:
     try:
         import microwakeword  # noqa: F401
@@ -631,7 +654,9 @@ def step_generate_positive_features() -> bool:
     aug_cfg = cfg.get("augmentation", {})
     augmenter = Augmentation(
         augmentation_duration_s=float(aug_cfg.get("duration_s", 3.2)),
-        augmentation_probabilities=aug_cfg.get("probabilities", {}),
+        augmentation_probabilities=_resolve_augmentation_probabilities(
+            aug_cfg.get("probabilities", {})
+        ),
         impulse_paths=[str(DATA_DIR / "mit_rirs")],
         background_paths=[str(DATA_DIR / "fma_16k"), str(DATA_DIR / "audioset_16k")],
         background_min_snr_db=int(aug_cfg.get("background_min_snr_db", -5)),
