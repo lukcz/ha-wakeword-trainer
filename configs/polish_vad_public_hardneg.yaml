@@ -101,6 +101,7 @@ asset_subsets:
   audioset_max_clips: 1600
   fma_max_clips: 1000
   io_workers: 8
+  bootstrap_workers: 3
 
 runtime:
   device: "cpu"

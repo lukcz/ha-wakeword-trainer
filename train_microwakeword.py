@@ -362,6 +362,17 @@ def _resolve_io_workers(cfg: dict | None = None, default: int = 4) -> int:
     return max(1, int(cfg.get("io_workers", default)))
 
 
+def _resolve_bootstrap_workers(cfg: dict | None = None, default: int = 3) -> int:
+    if not cfg:
+        return default
+    if "bootstrap_workers" in cfg:
+        return max(1, int(cfg["bootstrap_workers"]))
+    asset_cfg = cfg.get("asset_subsets", {}) or {}
+    if "bootstrap_workers" in asset_cfg:
+        return max(1, int(asset_cfg["bootstrap_workers"]))
+    return default
+
+
 def _write_audio_file(dest: Path, samples, sampling_rate: int) -> None:
     import soundfile as sf
 
@@ -665,13 +676,18 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
 
 
 def _bootstrap_positive_speech_datasets(cfg: dict) -> None:
-    for dataset_cfg in cfg.get("bootstrap_speech_datasets", []) or []:
-        kind = str(dataset_cfg.get("kind", "")).strip().lower()
-        enabled = bool(dataset_cfg.get("enabled", True))
-        optional = bool(dataset_cfg.get("optional", False))
+    dataset_entries = [
+        dataset_cfg
+        for dataset_cfg in (cfg.get("bootstrap_speech_datasets", []) or [])
+        if bool(dataset_cfg.get("enabled", True))
+    ]
 
-        if not enabled:
-            continue
+    if not dataset_entries:
+        return
+
+    def bootstrap(dataset_cfg: dict) -> None:
+        kind = str(dataset_cfg.get("kind", "")).strip().lower()
+        optional = bool(dataset_cfg.get("optional", False))
 
         try:
             if kind == "fleurs":
@@ -692,15 +708,26 @@ def _bootstrap_positive_speech_datasets(cfg: dict) -> None:
             else:
                 raise
 
+    workers = min(_resolve_bootstrap_workers(cfg), len(dataset_entries))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(bootstrap, dataset_cfg) for dataset_cfg in dataset_entries]
+        for future in futures:
+            future.result()
+
 
 def _bootstrap_background_audio_datasets(cfg: dict) -> None:
-    for dataset_cfg in cfg.get("bootstrap_background_datasets", []) or []:
-        kind = str(dataset_cfg.get("kind", "")).strip().lower()
-        enabled = bool(dataset_cfg.get("enabled", True))
-        optional = bool(dataset_cfg.get("optional", False))
+    dataset_entries = [
+        dataset_cfg
+        for dataset_cfg in (cfg.get("bootstrap_background_datasets", []) or [])
+        if bool(dataset_cfg.get("enabled", True))
+    ]
 
-        if not enabled:
-            continue
+    if not dataset_entries:
+        return
+
+    def bootstrap(dataset_cfg: dict) -> None:
+        kind = str(dataset_cfg.get("kind", "")).strip().lower()
+        optional = bool(dataset_cfg.get("optional", False))
 
         try:
             if kind == "hf_audio":
@@ -714,6 +741,12 @@ def _bootstrap_background_audio_datasets(cfg: dict) -> None:
                 log.warning("  Optional background dataset bootstrap skipped for %s: %s", kind, exc)
             else:
                 raise
+
+    workers = min(_resolve_bootstrap_workers(cfg), len(dataset_entries))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(bootstrap, dataset_cfg) for dataset_cfg in dataset_entries]
+        for future in futures:
+            future.result()
 
 
 def _resolve_positive_sources(cfg: dict) -> list[Path]:
