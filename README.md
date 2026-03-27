@@ -102,12 +102,23 @@ By default the bootstrap tries:
 - `mozilla-foundation/common_voice_16_0` for `pl`
 - `google/fleurs` for `pl_pl`
 - `bond005/audioset-nonspeech` for extra nonspeech background clips
+- `haydarkadioglu/speech-noise-dataset` filtered to `noise_only`
+- `philgzl/wham` as an optional higher-quality urban-noise source
+- `Aynursusuz/musan-audio-dataset` filtered to `music` and `noise`
 - any local datasets you place in `data/mc_speech` or `data/pl_speech`
 
 `AxonData/speech-free-background-noise` is no longer enabled by default in the
 Polish VAD presets because some recordings may still contain intelligible speech
 or announcements. You can re-enable it manually if you curate/filter those
 clips for your own setup.
+
+The `polish_vad_public_hardneg.yaml` preset is the widest public bootstrap and
+combines:
+
+- `audioset-nonspeech`
+- `speech-noise-dataset` with only `noise_only`
+- `WHAM!` noise clips
+- `MUSAN` filtered to `music` and `noise`
 
 So the repository can now bootstrap a much larger public-only VAD setup without requiring your own recordings, although real device-specific recordings can still help later.
 

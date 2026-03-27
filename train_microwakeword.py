@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -424,9 +425,7 @@ def _write_dataset_audio(
                 break
 
             try:
-                audio = row[audio_column]
-                samples = np.asarray(audio["array"], dtype="float32")
-                sampling_rate = audio["sampling_rate"]
+                samples, sampling_rate = _extract_row_audio(row, audio_column)
             except Exception:
                 continue
 
@@ -453,6 +452,64 @@ def _write_dataset_audio(
             future.result()
 
     return count
+
+
+def _extract_row_audio(row: dict, audio_column: str) -> tuple["np.ndarray", int]:
+    import numpy as np
+    import soundfile as sf
+
+    audio = row[audio_column]
+    if isinstance(audio, dict) and "array" in audio and "sampling_rate" in audio:
+        samples = np.asarray(audio["array"], dtype="float32")
+        sampling_rate = int(audio["sampling_rate"])
+    elif isinstance(audio, (bytes, bytearray)):
+        samples, sampling_rate = sf.read(io.BytesIO(audio), dtype="float32")
+        samples = np.asarray(samples, dtype="float32")
+    else:
+        raise ValueError(f"Unsupported audio payload type for column '{audio_column}'")
+
+    if samples.ndim > 1:
+        samples = np.mean(samples, axis=-1, dtype="float32")
+
+    return np.asarray(samples, dtype="float32"), sampling_rate
+
+
+def _normalize_filter_values(value) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value}
+    return {str(value)}
+
+
+def _row_matches_dataset_filters(row: dict, dataset_cfg: dict) -> bool:
+    filter_column = dataset_cfg.get("filter_column")
+    if filter_column:
+        actual = str(row.get(str(filter_column), ""))
+        allow_values = _normalize_filter_values(dataset_cfg.get("filter_allow_values"))
+        deny_values = _normalize_filter_values(dataset_cfg.get("filter_deny_values"))
+        if allow_values and actual not in allow_values:
+            return False
+        if deny_values and actual in deny_values:
+            return False
+
+    path_column = str(dataset_cfg.get("path_column", ""))
+    if path_column:
+        actual_path = str(row.get(path_column, ""))
+        must_contain = _normalize_filter_values(dataset_cfg.get("path_must_contain"))
+        deny_contains = _normalize_filter_values(dataset_cfg.get("path_deny_contains"))
+        if must_contain and not any(fragment in actual_path for fragment in must_contain):
+            return False
+        if deny_contains and any(fragment in actual_path for fragment in deny_contains):
+            return False
+
+    return True
+
+
+def _iter_filtered_dataset(dataset, dataset_cfg: dict):
+    for row in dataset:
+        if _row_matches_dataset_filters(row, dataset_cfg):
+            yield row
 
 
 def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
@@ -501,7 +558,7 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
             dataset = load(split_name, False)
 
         count += _write_dataset_audio(
-            dataset,
+            _iter_filtered_dataset(dataset, dataset_cfg),
             output_dir,
             prefix,
             max_clips - count,
@@ -548,6 +605,25 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
         "streaming": dataset_cfg.get("streaming", True),
         "fallback_to_non_streaming": dataset_cfg.get("fallback_to_non_streaming", True),
         "audio_column": dataset_cfg.get("audio_column", "audio"),
+    }
+    if "io_workers" in dataset_cfg:
+        merged["io_workers"] = dataset_cfg["io_workers"]
+    _download_hf_audio_dataset(merged)
+
+
+def _download_wham_dataset(dataset_cfg: dict) -> None:
+    merged = {
+        "hf_repo": dataset_cfg.get("hf_repo", "philgzl/wham"),
+        "output_dir": dataset_cfg.get("output_dir", "data/wham_noise"),
+        "split": dataset_cfg.get("split", "train"),
+        "max_clips": dataset_cfg.get("max_clips", 4000),
+        "prefix": dataset_cfg.get("prefix", "wham_noise"),
+        "streaming": dataset_cfg.get("streaming", True),
+        "fallback_to_non_streaming": dataset_cfg.get("fallback_to_non_streaming", True),
+        "audio_column": dataset_cfg.get("audio_column", "audio"),
+        "segment_duration_s": dataset_cfg.get("segment_duration_s", 5.0),
+        "segment_overlap_s": dataset_cfg.get("segment_overlap_s", 2.5),
+        "min_segment_duration_s": dataset_cfg.get("min_segment_duration_s", 4.0),
     }
     if "io_workers" in dataset_cfg:
         merged["io_workers"] = dataset_cfg["io_workers"]
@@ -604,6 +680,8 @@ def _bootstrap_positive_speech_datasets(cfg: dict) -> None:
                 _download_bigos_dataset(dataset_cfg)
             elif kind == "common_voice":
                 _download_common_voice_dataset(dataset_cfg)
+            elif kind == "wham":
+                _download_wham_dataset(dataset_cfg)
             elif kind == "hf_audio":
                 _download_hf_audio_dataset(dataset_cfg)
             else:
@@ -625,9 +703,12 @@ def _bootstrap_background_audio_datasets(cfg: dict) -> None:
             continue
 
         try:
-            if kind != "hf_audio":
+            if kind == "hf_audio":
+                _download_hf_audio_dataset(dataset_cfg)
+            elif kind == "wham":
+                _download_wham_dataset(dataset_cfg)
+            else:
                 raise ValueError(f"Unsupported background dataset kind: {kind}")
-            _download_hf_audio_dataset(dataset_cfg)
         except Exception as exc:
             if optional:
                 log.warning("  Optional background dataset bootstrap skipped for %s: %s", kind, exc)
