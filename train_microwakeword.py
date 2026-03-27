@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ DATA_DIR = SCRIPT_DIR / "data"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 EXPORT_DIR = SCRIPT_DIR / "export"
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
+TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
 
 CONFIG_FILE = DEFAULT_CONFIG
 
@@ -68,6 +70,24 @@ def _download(url: str, dest: Path, description: str, force: bool = False) -> No
                 if chunk:
                     handle.write(chunk)
         tmp.replace(dest)
+
+
+def _ensure_python_module(module_name: str, pip_requirement: str) -> bool:
+    if importlib.util.find_spec(module_name) is not None:
+        return True
+
+    log.warning("  Python module '%s' is missing. Installing %s", module_name, pip_requirement)
+    try:
+        _run([sys.executable, "-m", "pip", "install", pip_requirement])
+    except subprocess.CalledProcessError:
+        log.error("  Automatic installation failed for %s", pip_requirement)
+        return False
+
+    if importlib.util.find_spec(module_name) is None:
+        log.error("  Module '%s' is still missing after installation", module_name)
+        return False
+
+    return True
 
 
 def _load_config(path: Path | None = None) -> dict:
@@ -808,6 +828,8 @@ def _write_training_config(cfg: dict) -> Path:
 
 def step_train() -> bool:
     if not _check_micro_wake_word_import():
+        return False
+    if not _ensure_python_module("tensorboard", TENSORBOARD_PIP_SPEC):
         return False
 
     cfg = _load_config()

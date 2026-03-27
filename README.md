@@ -63,6 +63,8 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
+The training launcher also auto-installs `tensorboard` if an older `.venv` is missing it.
+
 By default the bootstrap tries:
 
 - `amu-cai/pl-asr-bigos-v2` if you have access
