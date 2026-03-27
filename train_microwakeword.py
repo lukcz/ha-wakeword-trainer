@@ -367,6 +367,41 @@ def _write_audio_file(dest: Path, samples, sampling_rate: int) -> None:
     sf.write(dest, samples, sampling_rate)
 
 
+def _segment_audio_samples(
+    samples,
+    sampling_rate: int,
+    segment_duration_s: float | None,
+    segment_overlap_s: float = 0.0,
+    min_segment_duration_s: float | None = None,
+):
+    import numpy as np
+
+    if not segment_duration_s or segment_duration_s <= 0:
+        yield np.asarray(samples, dtype="float32")
+        return
+
+    total = len(samples)
+    segment_len = max(1, int(segment_duration_s * sampling_rate))
+    min_len = int((min_segment_duration_s or segment_duration_s) * sampling_rate)
+    overlap_len = max(0, int(segment_overlap_s * sampling_rate))
+    step = max(1, segment_len - overlap_len)
+
+    if total <= segment_len:
+        if total >= min_len:
+            yield np.asarray(samples, dtype="float32")
+        return
+
+    start = 0
+    while start + min_len <= total:
+        end = min(total, start + segment_len)
+        chunk = np.asarray(samples[start:end], dtype="float32")
+        if len(chunk) >= min_len:
+            yield chunk
+        if end >= total:
+            break
+        start += step
+
+
 def _write_dataset_audio(
     dataset,
     output_dir: Path,
@@ -374,6 +409,9 @@ def _write_dataset_audio(
     max_clips: int | None,
     io_workers: int,
     audio_column: str = "audio",
+    segment_duration_s: float | None = None,
+    segment_overlap_s: float = 0.0,
+    min_segment_duration_s: float | None = None,
 ) -> int:
     import numpy as np
 
@@ -392,9 +430,19 @@ def _write_dataset_audio(
             except Exception:
                 continue
 
-            dest = output_dir / f"{prefix}_{count:06d}.wav"
-            futures.add(executor.submit(_write_audio_file, dest, samples, sampling_rate))
-            count += 1
+            for chunk in _segment_audio_samples(
+                samples,
+                sampling_rate,
+                segment_duration_s=segment_duration_s,
+                segment_overlap_s=segment_overlap_s,
+                min_segment_duration_s=min_segment_duration_s,
+            ):
+                if max_clips is not None and count >= max_clips:
+                    break
+
+                dest = output_dir / f"{prefix}_{count:06d}.wav"
+                futures.add(executor.submit(_write_audio_file, dest, chunk, sampling_rate))
+                count += 1
 
             if len(futures) >= io_workers * 4:
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
@@ -421,6 +469,9 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
     trust_remote_code = bool(dataset_cfg.get("trust_remote_code", False))
     prefer_streaming = bool(dataset_cfg.get("streaming", True))
     fallback_to_non_streaming = bool(dataset_cfg.get("fallback_to_non_streaming", True))
+    segment_duration_s = dataset_cfg.get("segment_duration_s")
+    segment_overlap_s = float(dataset_cfg.get("segment_overlap_s", 0.0))
+    min_segment_duration_s = dataset_cfg.get("min_segment_duration_s")
 
     if _dir_has_entries(output_dir):
         log.info("  HF audio dataset already present at %s", output_dir)
@@ -456,6 +507,9 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
             max_clips - count,
             io_workers,
             audio_column=audio_column,
+            segment_duration_s=float(segment_duration_s) if segment_duration_s else None,
+            segment_overlap_s=segment_overlap_s,
+            min_segment_duration_s=float(min_segment_duration_s) if min_segment_duration_s else None,
         )
 
     log.info("  Saved %d clips from %s to %s", count, repo, output_dir)

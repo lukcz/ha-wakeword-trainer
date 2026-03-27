@@ -46,6 +46,9 @@ bootstrap_background_datasets:
     split: "train"
     max_clips: 3000
     prefix: "speech_free_bg"
+    segment_duration_s: 5.0
+    segment_overlap_s: 2.5
+    min_segment_duration_s: 4.0
   - kind: "hf_audio"
     enabled: true
     optional: true

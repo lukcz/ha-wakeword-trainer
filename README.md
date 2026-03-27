@@ -68,6 +68,13 @@ You can tune the locally downloaded ambient subsets in that config:
 - `asset_subsets.audioset_max_clips`
 - `asset_subsets.fma_max_clips`
 - `asset_subsets.io_workers`
+
+For public background datasets with long recordings, the bootstrap can also cut
+each source file into shorter augmentation clips:
+
+- `segment_duration_s`
+- `segment_overlap_s`
+- `min_segment_duration_s`
 - `runtime.device`
 - `runtime.allow_cpu_fallback`
 
