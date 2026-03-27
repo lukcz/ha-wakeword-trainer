@@ -41,6 +41,9 @@ runtime:
   allow_cpu_fallback: true
   disable_xla_auto_jit: true
   xla_gpu_strict_conv_algorithm_picker: false
+  tf_enable_onednn_opts: true
+  intra_op_threads: 8
+  inter_op_threads: 2
 
 negative_feature_weights:
   speech: 8.0
@@ -83,8 +86,8 @@ training:
   learning_rates: [0.001, 0.0003]
   positive_class_weight: [2]
   negative_class_weight: [12]
-  batch_size: 128
-  eval_step_interval: 500
+  batch_size: 256
+  eval_step_interval: 1000
   clip_duration_ms: 1500
   minimization_metric: null
   target_minimization: 0.9

@@ -43,6 +43,7 @@ Alternative Polish VAD presets:
 
 - `configs/polish_vad_balanced.yaml`: less conservative than the default, better balance of recall vs false activations
 - `configs/polish_vad_high_recall.yaml`: pushes recall harder, useful if the detector misses too much speech
+- both presets also use a larger batch size and CPU thread hints for better throughput on 8-core desktop CPUs
 
 Examples:
 
