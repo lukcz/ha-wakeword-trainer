@@ -71,7 +71,7 @@ The VAD flow:
 
 1. downloads augmentation assets
 2. downloads official negative feature packs used by microWakeWord
-3. bootstraps positive speech data for Polish
+3. bootstraps public Polish speech data and extra ambient/noise corpora
 4. prepares positive speech features
 5. trains a custom model
 6. exports `.tflite` and `.json` for ESPHome
@@ -88,10 +88,13 @@ The training launcher also auto-installs `tensorboard` if an older `.venv` is mi
 By default the bootstrap tries:
 
 - `amu-cai/pl-asr-bigos-v2` if you have access
+- `mozilla-foundation/common_voice_16_0` for `pl`
 - `google/fleurs` for `pl_pl`
+- `AxonData/speech-free-background-noise` for public no-speech ambience
+- `bond005/audioset-nonspeech` for extra nonspeech background clips
 - any local datasets you place in `data/mc_speech` or `data/pl_speech`
 
-So the repository can still start without a fully manual dataset setup, but real recordings remain better.
+So the repository can now bootstrap a much larger public-only VAD setup without requiring your own recordings, although real device-specific recordings can still help later.
 
 For the bundled Polish VAD config, the default runtime is CPU because TensorFlow on WSL2 with very new NVIDIA GPUs can be unstable during the `train` step.
 

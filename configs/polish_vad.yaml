@@ -6,6 +6,7 @@ wake_word: "vad"
 positive_dataset_paths:
   - "data/bigos"
   - "data/fleurs_pl"
+  - "data/common_voice_pl"
   - "data/mc_speech"
   - "data/pl_speech"
 positive_file_pattern: "**/*.wav"
@@ -26,6 +27,35 @@ bootstrap_speech_datasets:
     hf_config: "pl_pl"
     split: "train+validation"
     max_clips: 1500
+  - kind: "common_voice"
+    enabled: true
+    optional: true
+    output_dir: "data/common_voice_pl"
+    hf_config: "pl"
+    split: "train+validation"
+    max_clips: 1500
+
+background_audio_paths:
+  - "data/speech_free_background_noise"
+  - "data/audioset_nonspeech"
+
+bootstrap_background_datasets:
+  - kind: "hf_audio"
+    enabled: true
+    optional: true
+    hf_repo: "AxonData/speech-free-background-noise"
+    output_dir: "data/speech_free_background_noise"
+    split: "train"
+    max_clips: 1000
+    prefix: "speech_free_bg"
+  - kind: "hf_audio"
+    enabled: true
+    optional: true
+    hf_repo: "bond005/audioset-nonspeech"
+    output_dir: "data/audioset_nonspeech"
+    split: "train"
+    max_clips: 1000
+    prefix: "audioset_nonspeech"
 
 # For VAD we still want ambient and off-target speech negatives.
 negative_feature_sets:

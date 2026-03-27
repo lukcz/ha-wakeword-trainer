@@ -373,6 +373,7 @@ def _write_dataset_audio(
     prefix: str,
     max_clips: int | None,
     io_workers: int,
+    audio_column: str = "audio",
 ) -> int:
     import numpy as np
 
@@ -385,7 +386,7 @@ def _write_dataset_audio(
                 break
 
             try:
-                audio = row["audio"]
+                audio = row[audio_column]
                 samples = np.asarray(audio["array"], dtype="float32")
                 sampling_rate = audio["sampling_rate"]
             except Exception:
@@ -406,38 +407,97 @@ def _write_dataset_audio(
     return count
 
 
+def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
+    from datasets import load_dataset
+
+    repo = str(dataset_cfg["hf_repo"])
+    output_dir = _resolve_path(str(dataset_cfg["output_dir"]))
+    max_clips = int(dataset_cfg.get("max_clips", 1200))
+    split = str(dataset_cfg.get("split", "train"))
+    hf_config = dataset_cfg.get("hf_config")
+    audio_column = str(dataset_cfg.get("audio_column", "audio"))
+    prefix = str(dataset_cfg.get("prefix", repo.split("/")[-1].replace("-", "_")))
+    io_workers = _resolve_io_workers(dataset_cfg)
+    trust_remote_code = bool(dataset_cfg.get("trust_remote_code", False))
+    prefer_streaming = bool(dataset_cfg.get("streaming", True))
+    fallback_to_non_streaming = bool(dataset_cfg.get("fallback_to_non_streaming", True))
+
+    if _dir_has_entries(output_dir):
+        log.info("  HF audio dataset already present at %s", output_dir)
+        return
+
+    _reset_dir(output_dir)
+    count = 0
+    dataset_kwargs = {}
+    if hf_config is not None and str(hf_config).strip():
+        dataset_kwargs["name"] = str(hf_config)
+    if trust_remote_code:
+        dataset_kwargs["trust_remote_code"] = True
+
+    def load(split_name: str, streaming: bool):
+        return load_dataset(repo, split=split_name, streaming=streaming, **dataset_kwargs)
+
+    for split_name in _split_spec_parts(split):
+        if count >= max_clips:
+            break
+
+        dataset = None
+        try:
+            dataset = load(split_name, prefer_streaming)
+        except Exception:
+            if not fallback_to_non_streaming:
+                raise
+            dataset = load(split_name, False)
+
+        count += _write_dataset_audio(
+            dataset,
+            output_dir,
+            prefix,
+            max_clips - count,
+            io_workers,
+            audio_column=audio_column,
+        )
+
+    log.info("  Saved %d clips from %s to %s", count, repo, output_dir)
+
+
 def _split_spec_parts(split_spec: str) -> list[str]:
     normalized = split_spec.replace(",", "+")
     return [part.strip() for part in normalized.split("+") if part.strip()]
 
 
 def _download_fleurs_dataset(dataset_cfg: dict) -> None:
-    from datasets import load_dataset
+    merged = {
+        "hf_repo": "google/fleurs",
+        "hf_config": dataset_cfg.get("hf_config", "pl_pl"),
+        "output_dir": dataset_cfg.get("output_dir", "data/fleurs_pl"),
+        "split": dataset_cfg.get("split", "train+validation"),
+        "max_clips": dataset_cfg.get("max_clips", 1200),
+        "prefix": dataset_cfg.get("prefix", "fleurs"),
+        "streaming": dataset_cfg.get("streaming", True),
+        "fallback_to_non_streaming": dataset_cfg.get("fallback_to_non_streaming", True),
+        "audio_column": dataset_cfg.get("audio_column", "audio"),
+    }
+    if "io_workers" in dataset_cfg:
+        merged["io_workers"] = dataset_cfg["io_workers"]
+    _download_hf_audio_dataset(merged)
 
-    output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/fleurs_pl")))
-    max_clips = int(dataset_cfg.get("max_clips", 1200))
-    split = str(dataset_cfg.get("split", "train+validation"))
-    hf_config = str(dataset_cfg.get("hf_config", "pl_pl"))
-    io_workers = _resolve_io_workers(dataset_cfg)
 
-    if _dir_has_entries(output_dir):
-        log.info("  FLEURS dataset already present at %s", output_dir)
-        return
-
-    _reset_dir(output_dir)
-    count = 0
-    for split_name in _split_spec_parts(split):
-        if count >= max_clips:
-            break
-        dataset = load_dataset("google/fleurs", hf_config, split=split_name, streaming=True)
-        count += _write_dataset_audio(
-            dataset,
-            output_dir,
-            "fleurs",
-            max_clips - count,
-            io_workers,
-        )
-    log.info("  Saved %d FLEURS clips to %s", count, output_dir)
+def _download_common_voice_dataset(dataset_cfg: dict) -> None:
+    merged = {
+        "hf_repo": "mozilla-foundation/common_voice_16_0",
+        "hf_config": dataset_cfg.get("hf_config", "pl"),
+        "output_dir": dataset_cfg.get("output_dir", "data/common_voice_pl"),
+        "split": dataset_cfg.get("split", "train+validation"),
+        "max_clips": dataset_cfg.get("max_clips", 1200),
+        "prefix": dataset_cfg.get("prefix", "common_voice"),
+        "streaming": dataset_cfg.get("streaming", True),
+        "fallback_to_non_streaming": dataset_cfg.get("fallback_to_non_streaming", True),
+        "audio_column": dataset_cfg.get("audio_column", "audio"),
+    }
+    if "io_workers" in dataset_cfg:
+        merged["io_workers"] = dataset_cfg["io_workers"]
+    _download_hf_audio_dataset(merged)
 
 
 def _download_bigos_dataset(dataset_cfg: dict) -> None:
@@ -488,11 +548,35 @@ def _bootstrap_positive_speech_datasets(cfg: dict) -> None:
                 _download_fleurs_dataset(dataset_cfg)
             elif kind == "bigos":
                 _download_bigos_dataset(dataset_cfg)
+            elif kind == "common_voice":
+                _download_common_voice_dataset(dataset_cfg)
+            elif kind == "hf_audio":
+                _download_hf_audio_dataset(dataset_cfg)
             else:
                 raise ValueError(f"Unsupported bootstrap dataset kind: {kind}")
         except Exception as exc:
             if optional:
                 log.warning("  Optional dataset bootstrap skipped for %s: %s", kind, exc)
+            else:
+                raise
+
+
+def _bootstrap_background_audio_datasets(cfg: dict) -> None:
+    for dataset_cfg in cfg.get("bootstrap_background_datasets", []) or []:
+        kind = str(dataset_cfg.get("kind", "")).strip().lower()
+        enabled = bool(dataset_cfg.get("enabled", True))
+        optional = bool(dataset_cfg.get("optional", False))
+
+        if not enabled:
+            continue
+
+        try:
+            if kind != "hf_audio":
+                raise ValueError(f"Unsupported background dataset kind: {kind}")
+            _download_hf_audio_dataset(dataset_cfg)
+        except Exception as exc:
+            if optional:
+                log.warning("  Optional background dataset bootstrap skipped for %s: %s", kind, exc)
             else:
                 raise
 
@@ -701,6 +785,26 @@ def _negative_feature_names(cfg: dict) -> list[str]:
     return ["speech", "dinner_party", "no_speech", "dinner_party_eval"]
 
 
+def _resolve_background_audio_paths(cfg: dict) -> list[str]:
+    defaults = [DATA_DIR / "fma_16k", DATA_DIR / "audioset_16k"]
+    configured = [_resolve_path(str(path)) for path in cfg.get("background_audio_paths", []) or [] if str(path).strip()]
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for path in [*defaults, *configured]:
+        try:
+            has_entries = _dir_has_entries(path)
+        except Exception:
+            has_entries = False
+        if not has_entries:
+            continue
+        key = str(path)
+        if key not in seen:
+            resolved.append(key)
+            seen.add(key)
+    return resolved
+
+
 def step_download_assets() -> bool:
     cfg = _load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -721,6 +825,7 @@ def step_download_assets() -> bool:
             limit=fma_max_clips,
             io_workers=io_workers,
         )
+        _bootstrap_background_audio_datasets(cfg)
 
         neg_root = _negative_datasets_dir(cfg)
         for name in _negative_feature_names(cfg):
@@ -904,6 +1009,15 @@ def step_audit_validation() -> bool:
     for label, count in hash_overlaps.items():
         log.info("    %-18s %d", label, count)
 
+    background_paths = _resolve_background_audio_paths(cfg)
+    log.info("  Background audio directories used for augmentation:")
+    if background_paths:
+        for path_str in background_paths:
+            path = Path(path_str)
+            log.info("    %-50s %6d files", path.name, len(_safe_iter_audio_files(path)))
+    else:
+        log.warning("    none")
+
     neg_root = _negative_datasets_dir(cfg)
     log.info("  Negative feature pack ambient stats:")
     found_any = False
@@ -992,13 +1106,16 @@ def step_generate_positive_features() -> bool:
     )
 
     aug_cfg = cfg.get("augmentation", {})
+    background_paths = _resolve_background_audio_paths(cfg)
+    if not background_paths:
+        log.warning("  No background audio directories were found for augmentation.")
     augmenter = Augmentation(
         augmentation_duration_s=float(aug_cfg.get("duration_s", 3.2)),
         augmentation_probabilities=_resolve_augmentation_probabilities(
             aug_cfg.get("probabilities", {})
         ),
         impulse_paths=[str(DATA_DIR / "mit_rirs")],
-        background_paths=[str(DATA_DIR / "fma_16k"), str(DATA_DIR / "audioset_16k")],
+        background_paths=background_paths,
         background_min_snr_db=int(aug_cfg.get("background_min_snr_db", -5)),
         background_max_snr_db=int(aug_cfg.get("background_max_snr_db", 10)),
         min_jitter_s=float(aug_cfg.get("min_jitter_s", 0.195)),
