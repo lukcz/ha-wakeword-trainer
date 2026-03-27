@@ -34,12 +34,11 @@ bootstrap_speech_datasets:
     max_clips: 3000
 
 background_audio_paths:
-  - "data/speech_free_background_noise"
   - "data/audioset_nonspeech"
 
 bootstrap_background_datasets:
   - kind: "hf_audio"
-    enabled: true
+    enabled: false
     optional: true
     hf_repo: "AxonData/speech-free-background-noise"
     output_dir: "data/speech_free_background_noise"

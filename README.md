@@ -101,9 +101,13 @@ By default the bootstrap tries:
 - `amu-cai/pl-asr-bigos-v2` if you have access
 - `mozilla-foundation/common_voice_16_0` for `pl`
 - `google/fleurs` for `pl_pl`
-- `AxonData/speech-free-background-noise` for public no-speech ambience
 - `bond005/audioset-nonspeech` for extra nonspeech background clips
 - any local datasets you place in `data/mc_speech` or `data/pl_speech`
+
+`AxonData/speech-free-background-noise` is no longer enabled by default in the
+Polish VAD presets because some recordings may still contain intelligible speech
+or announcements. You can re-enable it manually if you curate/filter those
+clips for your own setup.
 
 So the repository can now bootstrap a much larger public-only VAD setup without requiring your own recordings, although real device-specific recordings can still help later.
 
