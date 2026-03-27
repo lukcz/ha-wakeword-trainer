@@ -44,9 +44,9 @@ logging.basicConfig(
 log = logging.getLogger("train_microwakeword")
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> None:
+def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     log.info("$ %s", " ".join(cmd))
-    subprocess.check_call(cmd, cwd=str(cwd) if cwd else None)
+    subprocess.check_call(cmd, cwd=str(cwd) if cwd else None, env=env)
 
 
 def _download(url: str, dest: Path, description: str, force: bool = False) -> None:
@@ -167,6 +167,49 @@ def _resolve_augmentation_probabilities(raw_probabilities: dict) -> dict:
         )
 
     return resolved
+
+
+def _runtime_cfg(cfg: dict) -> dict:
+    return cfg.get("runtime", {}) or {}
+
+
+def _append_env_flag(env: dict[str, str], key: str, flag: str) -> None:
+    current = str(env.get(key, "")).strip()
+    flags = current.split() if current else []
+    if flag not in flags:
+        flags.append(flag)
+    env[key] = " ".join(flags)
+
+
+def _build_training_env(cfg: dict, force_device: str | None = None) -> tuple[dict[str, str], str]:
+    runtime = _runtime_cfg(cfg)
+    env = os.environ.copy()
+
+    device = str(force_device or runtime.get("device", "auto")).strip().lower()
+    if device not in {"auto", "gpu", "cpu"}:
+        raise ValueError("runtime.device must be one of: auto, gpu, cpu")
+
+    if device == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    if bool(runtime.get("disable_xla_auto_jit", True)):
+        _append_env_flag(env, "TF_XLA_FLAGS", "--tf_xla_auto_jit=0")
+
+    if not bool(runtime.get("xla_gpu_strict_conv_algorithm_picker", False)):
+        _append_env_flag(env, "XLA_FLAGS", "--xla_gpu_strict_conv_algorithm_picker=false")
+
+    if "tf_enable_onednn_opts" in runtime:
+        env["TF_ENABLE_ONEDNN_OPTS"] = "1" if bool(runtime["tf_enable_onednn_opts"]) else "0"
+
+    intra_threads = runtime.get("intra_op_threads")
+    if intra_threads:
+        env["TF_NUM_INTRAOP_THREADS"] = str(int(intra_threads))
+
+    inter_threads = runtime.get("inter_op_threads")
+    if inter_threads:
+        env["TF_NUM_INTEROP_THREADS"] = str(int(inter_threads))
+
+    return env, device
 
 
 def _check_micro_wake_word_import() -> bool:
@@ -807,10 +850,34 @@ def step_train() -> bool:
             "--stride",
             "3",
         ]
-        _run(cmd)
+        runtime = _runtime_cfg(cfg)
+        train_env, primary_device = _build_training_env(cfg)
+        log.info("  Training runtime device preference: %s", primary_device)
+        if train_env.get("TF_XLA_FLAGS"):
+            log.info("  TF_XLA_FLAGS=%s", train_env["TF_XLA_FLAGS"])
+        if train_env.get("XLA_FLAGS"):
+            log.info("  XLA_FLAGS=%s", train_env["XLA_FLAGS"])
+
+        try:
+            _run(cmd, env=train_env)
+        except subprocess.CalledProcessError as exc:
+            allow_cpu_fallback = bool(runtime.get("allow_cpu_fallback", True))
+            if primary_device != "cpu" and allow_cpu_fallback:
+                log.warning(
+                    "  GPU/auto training failed with exit code %d. Retrying once on CPU.",
+                    exc.returncode,
+                )
+                cpu_env, _ = _build_training_env(cfg, force_device="cpu")
+                log.info("  CPU fallback sets CUDA_VISIBLE_DEVICES=%s", cpu_env["CUDA_VISIBLE_DEVICES"])
+                _run(cmd, env=cpu_env)
+            else:
+                raise
         return True
     except subprocess.CalledProcessError as exc:
         log.error("  Training failed with exit code %d", exc.returncode)
+        return False
+    except ValueError as exc:
+        log.error("  Training runtime configuration is invalid: %s", exc)
         return False
 
 

@@ -44,6 +44,8 @@ You can tune the locally downloaded ambient subsets in that config:
 - `asset_subsets.audioset_max_clips`
 - `asset_subsets.fma_max_clips`
 - `asset_subsets.io_workers`
+- `runtime.device`
+- `runtime.allow_cpu_fallback`
 
 The VAD flow:
 
@@ -61,6 +63,20 @@ By default the bootstrap tries:
 - any local datasets you place in `data/mc_speech` or `data/pl_speech`
 
 So the repository can still start without a fully manual dataset setup, but real recordings remain better.
+
+If TensorFlow on WSL2 crashes during the `train` step on CUDA/XLA, the default runtime now:
+
+- disables XLA auto-JIT
+- relaxes strict XLA GPU conv algorithm picking
+- retries once on CPU automatically
+
+You can override that in the YAML:
+
+```yaml
+runtime:
+  device: "cpu"   # auto, gpu, cpu
+  allow_cpu_fallback: true
+```
 
 ## Fetch The Official VAD Anyway
 

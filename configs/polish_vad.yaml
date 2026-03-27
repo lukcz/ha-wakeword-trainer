@@ -40,6 +40,15 @@ asset_subsets:
   fma_max_clips: 200
   io_workers: 8
 
+# WSL2 + very new NVIDIA GPUs can be unstable with TensorFlow/XLA autotuning.
+# The default keeps GPU enabled when it works, but retries on CPU automatically
+# if the CUDA/XLA training step crashes.
+runtime:
+  device: "auto"
+  allow_cpu_fallback: true
+  disable_xla_auto_jit: true
+  xla_gpu_strict_conv_algorithm_picker: false
+
 negative_feature_weights:
   speech: 8.0
   dinner_party: 10.0

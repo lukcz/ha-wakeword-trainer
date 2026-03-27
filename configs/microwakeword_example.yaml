@@ -16,6 +16,12 @@ piper_model_url: "https://github.com/rhasspy/piper-sample-generator/releases/dow
 piper_model_filename: "en_US-libritts_r-medium.pt"
 piper_extra_args: []
 
+runtime:
+  device: "auto"
+  allow_cpu_fallback: true
+  disable_xla_auto_jit: true
+  xla_gpu_strict_conv_algorithm_picker: false
+
 augmentation:
   duration_s: 3.2
   background_min_snr_db: -5
