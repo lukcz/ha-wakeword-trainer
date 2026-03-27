@@ -73,7 +73,9 @@ By default the bootstrap tries:
 
 So the repository can still start without a fully manual dataset setup, but real recordings remain better.
 
-If TensorFlow on WSL2 crashes during the `train` step on CUDA/XLA, the default runtime now:
+For the bundled Polish VAD config, the default runtime is CPU because TensorFlow on WSL2 with very new NVIDIA GPUs can be unstable during the `train` step.
+
+The launcher still supports a more flexible runtime and:
 
 - disables XLA auto-JIT
 - relaxes strict XLA GPU conv algorithm picking

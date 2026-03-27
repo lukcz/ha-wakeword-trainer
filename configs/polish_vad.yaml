@@ -41,10 +41,10 @@ asset_subsets:
   io_workers: 8
 
 # WSL2 + very new NVIDIA GPUs can be unstable with TensorFlow/XLA autotuning.
-# The default keeps GPU enabled when it works, but retries on CPU automatically
-# if the CUDA/XLA training step crashes.
+# For VAD, default to CPU for predictable training runs. You can still switch
+# this to "gpu" or "auto" manually if your TensorFlow/CUDA stack is stable.
 runtime:
-  device: "auto"
+  device: "cpu"
   allow_cpu_fallback: true
   disable_xla_auto_jit: true
   xla_gpu_strict_conv_algorithm_picker: false
