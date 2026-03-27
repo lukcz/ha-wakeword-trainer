@@ -39,6 +39,18 @@ cp configs/microwakeword_example.yaml configs/my_model.yaml
 
 This uses `configs/polish_vad.yaml` by default.
 
+Alternative Polish VAD presets:
+
+- `configs/polish_vad_balanced.yaml`: less conservative than the default, better balance of recall vs false activations
+- `configs/polish_vad_high_recall.yaml`: pushes recall harder, useful if the detector misses too much speech
+
+Examples:
+
+```bash
+python train_microwakeword.py --config configs/polish_vad_balanced.yaml
+python train_microwakeword.py --config configs/polish_vad_high_recall.yaml
+```
+
 You can tune the locally downloaded ambient subsets in that config:
 
 - `asset_subsets.audioset_max_clips`

@@ -1,0 +1,105 @@
+task: "vad"
+model_name: "vad_pl_high_recall"
+wake_word: "vad"
+
+positive_dataset_paths:
+  - "data/bigos"
+  - "data/fleurs_pl"
+  - "data/mc_speech"
+  - "data/pl_speech"
+positive_file_pattern: "**/*.wav"
+
+bootstrap_speech_datasets:
+  - kind: "bigos"
+    enabled: true
+    optional: true
+    output_dir: "data/bigos"
+    hf_config: "all"
+    split: "train"
+    max_clips: 2000
+  - kind: "fleurs"
+    enabled: true
+    optional: false
+    output_dir: "data/fleurs_pl"
+    hf_config: "pl_pl"
+    split: "train+validation"
+    max_clips: 1500
+
+negative_feature_sets:
+  - "speech"
+  - "dinner_party"
+  - "no_speech"
+  - "dinner_party_eval"
+
+asset_subsets:
+  audioset_max_clips: 300
+  fma_max_clips: 200
+  io_workers: 8
+
+runtime:
+  device: "cpu"
+  allow_cpu_fallback: true
+  disable_xla_auto_jit: true
+  xla_gpu_strict_conv_algorithm_picker: false
+
+negative_feature_weights:
+  speech: 8.0
+  dinner_party: 10.0
+  no_speech: 6.0
+  dinner_party_eval: 0.0
+
+negative_feature_truncation:
+  speech: "random"
+  dinner_party: "random"
+  no_speech: "random"
+  dinner_party_eval: "split"
+
+positive_sampling_weight: 4.0
+positive_truncation_strategy: "truncate_start"
+remove_silence: false
+random_split_seed: 10
+split_count: 0.1
+
+augmentation:
+  duration_s: 3.2
+  background_min_snr_db: 2
+  background_max_snr_db: 18
+  min_jitter_s: 0.195
+  max_jitter_s: 0.205
+  probabilities:
+    SevenBandParametricEQ: 0.03
+    TanhDistortion: 0.03
+    PitchShift: 0.03
+    BandStopFilter: 0.03
+    AddColorNoise: 0.03
+    AddBackgroundNoise: 0.50
+    Gain: 1.0
+    GainTransition: 0.15
+    RIR: 0.20
+
+training:
+  train_dir: "output/vad_pl_high_recall/trained_model"
+  training_steps: [15000, 10000]
+  learning_rates: [0.001, 0.0003]
+  positive_class_weight: [3]
+  negative_class_weight: [10]
+  batch_size: 128
+  eval_step_interval: 500
+  clip_duration_ms: 1500
+  minimization_metric: null
+  target_minimization: 0.9
+  maximization_metric: "average_viable_recall"
+  time_mask_max_size: [0]
+  time_mask_count: [0]
+  freq_mask_max_size: [0]
+  freq_mask_count: [0]
+
+esphome_manifest:
+  probability_cutoff: 0.5
+  sliding_window_size: 5
+  tensor_arena_size: 16772
+  feature_step_size: 10
+  minimum_esphome_version: "2024.7.0"
+  trained_languages: ["pl"]
+  author: "ha-wakeword-trainer"
+  website: "https://github.com/lukcz/ha-wakeword-trainer"
