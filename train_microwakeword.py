@@ -147,10 +147,15 @@ def _resolve_augmentation_probabilities(raw_probabilities: dict) -> dict:
     except Exception:
         return dict(raw_probabilities)
 
+    support_checks = {
+        "RIR": "ApplyImpulseResponse",
+    }
+
     resolved = {}
     missing = []
     for name, probability in (raw_probabilities or {}).items():
-        if hasattr(audiomentations, name):
+        attr_name = support_checks.get(name, name)
+        if hasattr(audiomentations, attr_name):
             resolved[name] = probability
         else:
             missing.append(name)
