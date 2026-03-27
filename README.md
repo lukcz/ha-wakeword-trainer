@@ -46,6 +46,7 @@ Alternative Polish VAD presets:
 - `configs/polish_vad_low_fp.yaml`: prioritizes reducing ambient false positives, even if recall drops a bit
 - `configs/polish_vad_low_fp_stable.yaml`: low-FP preset with gentler learning-rate decay for more stable early checkpoints
 - `configs/polish_vad_public_large.yaml`: larger public-only bootstrap with more Polish speech and more background/noise clips
+- `configs/polish_vad_public_hybrid.yaml`: hybrid preset that mixes the wider public bootstrap with moderate hard-negative pressure
 - `configs/polish_vad_public_hardneg.yaml`: larger public bootstrap plus heavier hard-negatives for trying to get a bigger jump in false-positive robustness
 - `configs/polish_vad_public_hardneg_fast.yaml`: faster public hard-negative preset that skips the slowest optional background sources
 - `configs/polish_vad_very_low_fp.yaml`: aggressive low-FP preset for trying to get ambient false positives down further
@@ -59,6 +60,7 @@ python train_microwakeword.py --config configs/polish_vad_high_recall.yaml
 python train_microwakeword.py --config configs/polish_vad_low_fp.yaml
 python train_microwakeword.py --config configs/polish_vad_low_fp_stable.yaml
 python train_microwakeword.py --config configs/polish_vad_public_large.yaml
+python train_microwakeword.py --config configs/polish_vad_public_hybrid.yaml
 python train_microwakeword.py --config configs/polish_vad_public_hardneg.yaml
 python train_microwakeword.py --config configs/polish_vad_public_hardneg_fast.yaml
 python train_microwakeword.py --config configs/polish_vad_very_low_fp.yaml
