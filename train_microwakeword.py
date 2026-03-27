@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import tarfile
 import hashlib
 import importlib.util
 import io
@@ -734,6 +735,8 @@ def _bootstrap_background_audio_datasets(cfg: dict) -> None:
                 _download_hf_audio_dataset(dataset_cfg)
             elif kind == "wham":
                 _download_wham_dataset(dataset_cfg)
+            elif kind == "musan_openslr":
+                _download_musan_openslr(_resolve_path(str(dataset_cfg.get("output_dir", "data/musan_noise_music"))))
             else:
                 raise ValueError(f"Unsupported background dataset kind: {kind}")
         except Exception as exc:
@@ -846,6 +849,47 @@ def _download_mit_rirs(dest: Path, io_workers: int = 4) -> None:
     )
     count = _write_dataset_audio(dataset, dest, "rir", None, io_workers)
     log.info("  Saved %d RIR files", count)
+
+
+def _download_musan_openslr(dest: Path) -> None:
+    archive_dir = DATA_DIR / "_archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / "musan.tar.gz"
+
+    if _dir_has_entries(dest):
+        log.info("  MUSAN already present at %s", dest)
+        return
+
+    _download(
+        "https://openslr.trmal.net/resources/17/musan.tar.gz",
+        archive_path,
+        "MUSAN corpus (OpenSLR)",
+    )
+
+    extract_dir = archive_dir / "musan_extract"
+    _reset_dir(extract_dir)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(extract_dir)
+
+    musan_root = extract_dir / "musan"
+    if not musan_root.exists():
+        raise FileNotFoundError(f"Expected MUSAN root not found in archive: {musan_root}")
+
+    _reset_dir(dest)
+    copied = 0
+    for category in ("music", "noise"):
+        source_dir = musan_root / category
+        if not source_dir.exists():
+            continue
+        for audio_file in _safe_iter_audio_files(source_dir):
+            rel = audio_file.relative_to(musan_root)
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(audio_file, target)
+            copied += 1
+
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    log.info("  Prepared %d MUSAN music/noise files in %s", copied, dest)
 
 
 def _download_audioset_subset(dest: Path, limit: int = 300, io_workers: int = 4) -> None:

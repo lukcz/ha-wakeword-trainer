@@ -80,16 +80,10 @@ bootstrap_background_datasets:
     segment_duration_s: 5.0
     segment_overlap_s: 2.5
     min_segment_duration_s: 4.0
-  - kind: "hf_audio"
+  - kind: "musan_openslr"
     enabled: true
     optional: true
-    hf_repo: "Aynursusuz/musan-audio-dataset"
     output_dir: "data/musan_noise_music"
-    split: "train"
-    max_clips: 4000
-    prefix: "musan_noise_music"
-    filter_column: "label"
-    filter_allow_values: ["noise", "music"]
 
 negative_feature_sets:
   - "speech"
