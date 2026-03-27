@@ -90,6 +90,46 @@ def _ensure_python_module(module_name: str, pip_requirement: str) -> bool:
     return True
 
 
+def _patch_microwakeword_train_py() -> bool:
+    train_py = MWW_DIR / "microwakeword" / "train.py"
+    if not train_py.exists():
+        log.error("  microWakeWord training module not found at %s", train_py)
+        return False
+
+    original = train_py.read_text(encoding="utf-8")
+    updated = original
+
+    helper = """
+def _as_numpy(value):
+    return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+
+
+"""
+
+    marker = "def validate_nonstreaming(config, data_processor, model, test_set):\n"
+    if "_as_numpy(value):" not in updated:
+        if marker not in updated:
+            log.error("  Could not patch microWakeWord train.py: validate_nonstreaming marker not found")
+            return False
+        updated = updated.replace(marker, helper + marker, 1)
+
+    replacements = {
+        'result["fp"].numpy()': '_as_numpy(result["fp"])',
+        'ambient_predictions["tp"].numpy()': '_as_numpy(ambient_predictions["tp"])',
+        'ambient_predictions["fp"].numpy()': '_as_numpy(ambient_predictions["fp"])',
+        'ambient_predictions["fn"].numpy()': '_as_numpy(ambient_predictions["fn"])',
+    }
+    for old, new in replacements.items():
+        updated = updated.replace(old, new)
+
+    if updated == original:
+        return True
+
+    train_py.write_text(updated, encoding="utf-8")
+    log.info("  Patched microWakeWord metric compatibility in %s", train_py)
+    return True
+
+
 def _load_config(path: Path | None = None) -> dict:
     with open(path or CONFIG_FILE, encoding="utf-8") as handle:
         return yaml.safe_load(handle)
@@ -830,6 +870,8 @@ def step_train() -> bool:
     if not _check_micro_wake_word_import():
         return False
     if not _ensure_python_module("tensorboard", TENSORBOARD_PIP_SPEC):
+        return False
+    if not _patch_microwakeword_train_py():
         return False
 
     cfg = _load_config()
