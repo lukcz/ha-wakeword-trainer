@@ -118,6 +118,7 @@ def _as_numpy(value):
         'ambient_predictions["tp"].numpy()': '_as_numpy(ambient_predictions["tp"])',
         'ambient_predictions["fp"].numpy()': '_as_numpy(ambient_predictions["fp"])',
         'ambient_predictions["fn"].numpy()': '_as_numpy(ambient_predictions["fn"])',
+        "np.trapz(": "np.trapezoid(",
     }
     for old, new in replacements.items():
         updated = updated.replace(old, new)
