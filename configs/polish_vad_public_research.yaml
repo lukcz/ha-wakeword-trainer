@@ -50,7 +50,6 @@ bootstrap_speech_datasets:
 background_audio_paths:
   - "data/audioset_nonspeech"
   - "data/speech_noise_only"
-  - "data/wham_noise"
   - "data/musan_noise_music"
   - "data/sounds_of_home"
 
@@ -74,7 +73,7 @@ bootstrap_background_datasets:
     filter_column: "label"
     filter_allow_values: ["noise_only"]
   - kind: "wham"
-    enabled: true
+    enabled: false
     optional: true
     hf_repo: "philgzl/wham"
     output_dir: "data/wham_noise"
