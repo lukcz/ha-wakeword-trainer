@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -827,12 +828,55 @@ def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
 
 
 def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
-    return _stage_audio_sources(
-        staged_dir=_staged_background_dir(cfg),
-        manifest_path=_project_dir(cfg) / "staged_background_sources.json",
-        source_dirs=source_dirs,
-        label="background",
-    )
+    if not _background_segmentation_enabled(cfg):
+        return _stage_audio_sources(
+            staged_dir=_staged_background_dir(cfg),
+            manifest_path=_project_dir(cfg) / "staged_background_sources.json",
+            source_dirs=source_dirs,
+            label="background",
+        )
+
+    staged_dir = _staged_background_dir(cfg)
+    manifest_path = _project_dir(cfg) / "staged_background_sources.json"
+    seg_cfg = _background_segmentation_cfg(cfg)
+    source_manifest = {
+        "sources": [str(path) for path in source_dirs],
+        "segment_duration_s": float(seg_cfg.get("segment_duration_s", 5.0)),
+        "segment_overlap_s": float(seg_cfg.get("segment_overlap_s", 2.5)),
+        "min_segment_duration_s": float(seg_cfg.get("min_segment_duration_s", 4.0)),
+    }
+
+    if staged_dir.exists() and manifest_path.exists():
+        try:
+            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            current_manifest = None
+        if current_manifest == source_manifest and _safe_iter_audio_files(staged_dir):
+            log.info("  Using segmented staged background audio at %s", staged_dir)
+            return staged_dir
+
+    if staged_dir.exists():
+        shutil.rmtree(staged_dir)
+    staged_dir.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    for source_dir in source_dirs:
+        for audio_file in _safe_iter_audio_files(source_dir):
+            count += _segment_file_into_dir(
+                audio_file,
+                staged_dir,
+                prefix=f"{source_dir.name}_{count:06d}",
+                segment_duration_s=float(seg_cfg.get("segment_duration_s", 5.0)),
+                segment_overlap_s=float(seg_cfg.get("segment_overlap_s", 2.5)),
+                min_segment_duration_s=float(seg_cfg.get("min_segment_duration_s", 4.0)),
+            )
+
+    if count == 0:
+        raise ValueError("No background audio files were found in the configured source directories")
+
+    manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
+    log.info("  Segmented %d background audio clips into %s", count, staged_dir)
+    return staged_dir
 
 
 def _generated_background_negatives_cfg(cfg: dict) -> dict:
@@ -845,6 +889,166 @@ def _generated_background_negatives_enabled(cfg: dict) -> bool:
 
 def _generated_background_negative_manifest_path(cfg: dict) -> Path:
     return _project_dir(cfg) / "generated_background_negative_features.json"
+
+
+def _positive_segmentation_cfg(cfg: dict) -> dict:
+    return cfg.get("positive_segmentation", {}) or {}
+
+
+def _positive_segmentation_enabled(cfg: dict) -> bool:
+    return _task(cfg) == "vad" and bool(_positive_segmentation_cfg(cfg).get("enabled", False))
+
+
+def _segmented_positive_root(cfg: dict) -> Path:
+    return _project_dir(cfg) / "segmented_positive_audio"
+
+
+def _segmented_positive_manifest_path(cfg: dict) -> Path:
+    return _project_dir(cfg) / "segmented_positive_audio.json"
+
+
+def _background_segmentation_cfg(cfg: dict) -> dict:
+    return cfg.get("background_segmentation", {}) or {}
+
+
+def _background_segmentation_enabled(cfg: dict) -> bool:
+    return bool(_background_segmentation_cfg(cfg).get("enabled", False))
+
+
+def _split_dir_name(split_name: str) -> str:
+    return "training" if split_name == "train" else split_name
+
+
+def _extract_audio_from_file(path: Path) -> tuple["np.ndarray", int]:
+    import numpy as np
+    import soundfile as sf
+
+    samples, sampling_rate = sf.read(str(path), dtype="float32")
+    samples = np.asarray(samples, dtype="float32")
+    if samples.ndim > 1:
+        samples = np.mean(samples, axis=-1, dtype="float32")
+    return np.asarray(samples, dtype="float32"), int(sampling_rate)
+
+
+def _segment_file_into_dir(
+    src: Path,
+    dest_dir: Path,
+    prefix: str,
+    segment_duration_s: float,
+    segment_overlap_s: float = 0.0,
+    min_segment_duration_s: float | None = None,
+) -> int:
+    samples, sampling_rate = _extract_audio_from_file(src)
+    count = 0
+    for count, chunk in enumerate(
+        _segment_audio_samples(
+            samples,
+            sampling_rate,
+            segment_duration_s=segment_duration_s,
+            segment_overlap_s=segment_overlap_s,
+            min_segment_duration_s=min_segment_duration_s,
+        ),
+        start=1,
+    ):
+        _write_audio_file(dest_dir / f"{prefix}_{count:03d}.wav", chunk, sampling_rate)
+    return count
+
+
+def _split_source_files(files: list[Path], split_count: float, seed: int) -> dict[str, list[Path]]:
+    shuffled = sorted(files, key=lambda path: str(path))
+    rng = random.Random(seed)
+    rng.shuffle(shuffled)
+
+    total = len(shuffled)
+    holdout = int(round(total * split_count))
+    validation_count = min(holdout, total)
+    test_count = min(holdout, max(0, total - validation_count))
+    train_count = max(0, total - validation_count - test_count)
+
+    return {
+        "train": shuffled[:train_count],
+        "validation": shuffled[train_count:train_count + validation_count],
+        "test": shuffled[train_count + validation_count:train_count + validation_count + test_count],
+    }
+
+
+def _segmented_positive_split_dirs(cfg: dict) -> dict[str, Path]:
+    root = _segmented_positive_root(cfg)
+    return {
+        "train": root / "training",
+        "validation": root / "validation",
+        "test": root / "testing",
+    }
+
+
+def _prepare_segmented_positive_splits(cfg: dict, source_dirs: list[Path]) -> dict[str, Path]:
+    seg_cfg = _positive_segmentation_cfg(cfg)
+    split_dirs = _segmented_positive_split_dirs(cfg)
+    manifest_path = _segmented_positive_manifest_path(cfg)
+
+    source_manifest = {
+        "sources": [str(path) for path in source_dirs],
+        "segment_duration_s": float(seg_cfg.get("segment_duration_s", 5.0)),
+        "segment_overlap_s": float(seg_cfg.get("segment_overlap_s", 2.5)),
+        "min_segment_duration_s": float(seg_cfg.get("min_segment_duration_s", 4.0)),
+        "split_count": float(cfg.get("split_count", 0.1)),
+        "random_split_seed": int(cfg.get("random_split_seed", 10)),
+    }
+
+    if all(_dir_has_entries(path) for path in split_dirs.values()) and manifest_path.exists():
+        try:
+            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            current_manifest = None
+        if current_manifest == source_manifest:
+            log.info("  Using segmented positive splits at %s", _segmented_positive_root(cfg))
+            return split_dirs
+
+    root = _segmented_positive_root(cfg)
+    if root.exists():
+        shutil.rmtree(root)
+    for directory in split_dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    files: list[Path] = []
+    for source_dir in source_dirs:
+        files.extend(_safe_iter_audio_files(source_dir))
+
+    if not files:
+        raise ValueError("No positive audio files were found for segmentation")
+
+    splits = _split_source_files(
+        files,
+        split_count=float(cfg.get("split_count", 0.1)),
+        seed=int(cfg.get("random_split_seed", 10)),
+    )
+
+    segment_duration_s = float(seg_cfg.get("segment_duration_s", 5.0))
+    segment_overlap_s = float(seg_cfg.get("segment_overlap_s", 2.5))
+    min_segment_duration_s = float(seg_cfg.get("min_segment_duration_s", 4.0))
+
+    segment_counts: dict[str, int] = {"train": 0, "validation": 0, "test": 0}
+    for split_name, split_files in splits.items():
+        dest_dir = split_dirs[split_name]
+        for index, audio_file in enumerate(split_files):
+            segment_counts[split_name] += _segment_file_into_dir(
+                audio_file,
+                dest_dir,
+                prefix=f"{audio_file.stem}_{index:06d}",
+                segment_duration_s=segment_duration_s,
+                segment_overlap_s=segment_overlap_s,
+                min_segment_duration_s=min_segment_duration_s,
+            )
+
+    manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
+    log.info(
+        "  Segmented positive splits at %s: train=%d validation=%d test=%d",
+        root,
+        segment_counts["train"],
+        segment_counts["validation"],
+        segment_counts["test"],
+    )
+    return split_dirs
 
 
 def _has_any_mmap_dir(root: Path) -> bool:
@@ -1051,7 +1255,7 @@ def _negative_feature_names(cfg: dict) -> list[str]:
     return ["speech", "dinner_party", "no_speech", "dinner_party_eval"]
 
 
-def _resolve_background_audio_paths(cfg: dict) -> list[str]:
+def _base_background_audio_paths(cfg: dict) -> list[str]:
     defaults = [DATA_DIR / "fma_16k", DATA_DIR / "audioset_16k"]
     configured = [_resolve_path(str(path)) for path in cfg.get("background_audio_paths", []) or [] if str(path).strip()]
 
@@ -1068,6 +1272,16 @@ def _resolve_background_audio_paths(cfg: dict) -> list[str]:
         if key not in seen:
             resolved.append(key)
             seen.add(key)
+    return resolved
+
+
+def _resolve_background_audio_paths(cfg: dict) -> list[str]:
+    resolved = _base_background_audio_paths(cfg)
+
+    if _background_segmentation_enabled(cfg) and resolved:
+        staged = _stage_background_sources(cfg, [Path(path) for path in resolved])
+        return [str(staged)]
+
     return resolved
 
 
@@ -1144,6 +1358,9 @@ def step_prepare_positives() -> bool:
             if total_files == 0:
                 log.error("  Positive source directories exist, but no audio files were found")
                 return False
+            if _positive_segmentation_enabled(cfg):
+                _prepare_segmented_positive_splits(cfg, source_dirs)
+                return True
             if len(source_dirs) == 1:
                 log.info("  Using %d positive clips from %s", total_files, source_dirs[0])
             else:
@@ -1207,50 +1424,74 @@ def step_audit_validation() -> bool:
     cfg = _load_config()
     try:
         from mmap_ninja.ragged import RaggedMmap
-        from microwakeword.audio.clips import Clips
     except Exception as exc:
         log.error("  Audit dependencies are not available: %s", exc)
         return False
 
-    try:
-        positive_dir, file_pattern = _positive_source(cfg)
-    except Exception as exc:
-        log.error("  Could not resolve positive source for audit: %s", exc)
-        return False
-
-    try:
-        clips = Clips(
-            input_directory=str(positive_dir),
-            file_pattern=file_pattern,
-            max_clip_duration_s=None,
-            remove_silence=bool(cfg.get("remove_silence", False)),
-            random_split_seed=int(cfg.get("random_split_seed", 10)),
-            split_count=float(cfg.get("split_count", 0.1)),
-        )
-    except Exception as exc:
-        log.error("  Failed to build clip splits for audit: %s", exc)
-        return False
-
-    if not hasattr(clips, "split_clips"):
-        log.error("  Clips object did not expose split datasets; random_split_seed may be missing.")
-        return False
-
     split_paths: dict[str, list[str]] = {}
     split_hashes: dict[str, set[str]] = {}
-    for split_name in ("train", "validation", "test"):
-        dataset = clips.split_clips[split_name]
-        paths = [_clip_entry_path(entry) for entry in dataset]
-        split_paths[split_name] = paths
+    if _positive_segmentation_enabled(cfg):
+        split_dirs = _segmented_positive_split_dirs(cfg)
+        if not all(_dir_has_entries(path) for path in split_dirs.values()):
+            try:
+                source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
+                _prepare_segmented_positive_splits(cfg, source_dirs)
+            except Exception as exc:
+                log.error("  Failed to prepare segmented positive splits for audit: %s", exc)
+                return False
 
-        hashes: set[str] = set()
-        for path_str in paths:
-            path = Path(path_str)
-            if path.exists():
-                try:
-                    hashes.add(_hash_file(path))
-                except OSError as exc:
-                    log.warning("  Could not hash %s: %s", path, exc)
-        split_hashes[split_name] = hashes
+        for split_name, directory in split_dirs.items():
+            paths = [str(path) for path in _safe_iter_audio_files(directory)]
+            split_paths[split_name] = paths
+
+            hashes: set[str] = set()
+            for path_str in paths:
+                path = Path(path_str)
+                if path.exists():
+                    try:
+                        hashes.add(_hash_file(path))
+                    except OSError as exc:
+                        log.warning("  Could not hash %s: %s", path, exc)
+            split_hashes[split_name] = hashes
+    else:
+        try:
+            from microwakeword.audio.clips import Clips
+            positive_dir, file_pattern = _positive_source(cfg)
+        except Exception as exc:
+            log.error("  Could not resolve positive source for audit: %s", exc)
+            return False
+
+        try:
+            clips = Clips(
+                input_directory=str(positive_dir),
+                file_pattern=file_pattern,
+                max_clip_duration_s=None,
+                remove_silence=bool(cfg.get("remove_silence", False)),
+                random_split_seed=int(cfg.get("random_split_seed", 10)),
+                split_count=float(cfg.get("split_count", 0.1)),
+            )
+        except Exception as exc:
+            log.error("  Failed to build clip splits for audit: %s", exc)
+            return False
+
+        if not hasattr(clips, "split_clips"):
+            log.error("  Clips object did not expose split datasets; random_split_seed may be missing.")
+            return False
+
+        for split_name in ("train", "validation", "test"):
+            dataset = clips.split_clips[split_name]
+            paths = [_clip_entry_path(entry) for entry in dataset]
+            split_paths[split_name] = paths
+
+            hashes: set[str] = set()
+            for path_str in paths:
+                path = Path(path_str)
+                if path.exists():
+                    try:
+                        hashes.add(_hash_file(path))
+                    except OSError as exc:
+                        log.warning("  Could not hash %s: %s", path, exc)
+            split_hashes[split_name] = hashes
 
     log.info("  Positive split sizes:")
     for split_name in ("train", "validation", "test"):
@@ -1389,17 +1630,7 @@ def step_generate_positive_features() -> bool:
     from microwakeword.audio.clips import Clips
     from microwakeword.audio.spectrograms import SpectrogramGeneration
 
-    positive_dir, file_pattern = _positive_source(cfg)
     features_dir.mkdir(parents=True, exist_ok=True)
-
-    clips = Clips(
-        input_directory=str(positive_dir),
-        file_pattern=file_pattern,
-        max_clip_duration_s=None,
-        remove_silence=bool(cfg.get("remove_silence", False)),
-        random_split_seed=int(cfg.get("random_split_seed", 10)),
-        split_count=float(cfg.get("split_count", 0.1)),
-    )
 
     aug_cfg = cfg.get("augmentation", {})
     background_paths = _resolve_background_audio_paths(cfg)
@@ -1418,20 +1649,62 @@ def step_generate_positive_features() -> bool:
         max_jitter_s=float(aug_cfg.get("max_jitter_s", 0.205)),
     )
 
+    if _positive_segmentation_enabled(cfg):
+        source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
+        split_source_dirs = _prepare_segmented_positive_splits(cfg, source_dirs)
+        split_plan = (
+            ("training", split_source_dirs["train"], 1, 10),
+            ("validation", split_source_dirs["validation"], 1, 10),
+            ("testing", split_source_dirs["test"], 1, 1),
+        )
+    else:
+        positive_dir, file_pattern = _positive_source(cfg)
+        clips = Clips(
+            input_directory=str(positive_dir),
+            file_pattern=file_pattern,
+            max_clip_duration_s=None,
+            remove_silence=bool(cfg.get("remove_silence", False)),
+            random_split_seed=int(cfg.get("random_split_seed", 10)),
+            split_count=float(cfg.get("split_count", 0.1)),
+        )
+        split_plan = None
+
     for split in ("training", "validation", "testing"):
         out_dir = features_dir / split
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        split_name = "train"
         repetition = 2
         slide_frames = 10
+        clip_split = "train"
+        split_dir = None
         if split == "validation":
-            split_name = "validation"
             repetition = 1
+            clip_split = "validation"
         elif split == "testing":
-            split_name = "test"
             repetition = 1
             slide_frames = 1
+            clip_split = "test"
+
+        if split_plan is not None:
+            for split_name_key, split_source_dir, split_repetition, split_slide_frames in split_plan:
+                if split_name_key == split:
+                    split_dir = split_source_dir
+                    repetition = split_repetition
+                    slide_frames = split_slide_frames
+                    clip_split = "train"
+                    break
+
+            if split_dir is None:
+                raise ValueError(f"Missing segmented positive directory for split {split}")
+
+            clips = Clips(
+                input_directory=str(split_dir),
+                file_pattern="*.*",
+                max_clip_duration_s=None,
+                remove_silence=bool(cfg.get("remove_silence", False)),
+                random_split_seed=int(cfg.get("random_split_seed", 10)),
+                split_count=0.0,
+            )
 
         spectrograms = SpectrogramGeneration(
             clips=clips,
@@ -1443,7 +1716,7 @@ def step_generate_positive_features() -> bool:
         RaggedMmap.from_generator(
             out_dir=str(out_dir / "wakeword_mmap"),
             sample_generator=spectrograms.spectrogram_generator(
-                split=split_name,
+                split=clip_split,
                 repeat=repetition,
             ),
             batch_size=100,
@@ -1464,7 +1737,7 @@ def step_generate_background_negative_features() -> bool:
         log.info("  Generated background negatives are disabled for this config")
         return True
 
-    source_dirs = [Path(path) for path in _resolve_background_audio_paths(cfg)]
+    source_dirs = [Path(path) for path in _base_background_audio_paths(cfg)]
     if not source_dirs:
         log.warning("  No background audio directories were found for generated negative features.")
         return True
