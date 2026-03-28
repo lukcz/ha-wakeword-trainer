@@ -46,6 +46,7 @@ Alternative Polish VAD presets:
 - `configs/polish_vad_low_fp.yaml`: prioritizes reducing ambient false positives, even if recall drops a bit
 - `configs/polish_vad_low_fp_stable.yaml`: low-FP preset with gentler learning-rate decay for more stable early checkpoints
 - `configs/polish_vad_public_large.yaml`: larger public-only bootstrap with more Polish speech and more background/noise clips
+- `configs/polish_vad_public_large_bgneg.yaml`: `public_large` plus a generated negative mmap pack built from public background audio
 - `configs/polish_vad_public_hybrid.yaml`: hybrid preset that mixes the wider public bootstrap with moderate hard-negative pressure
 - `configs/polish_vad_public_xlarge.yaml`: experimental extra-large public bootstrap for testing whether sheer dataset scale helps
 - `configs/polish_vad_strict.yaml`: stricter preset for lower false positives, based on the hard-negative direction
@@ -62,6 +63,7 @@ python train_microwakeword.py --config configs/polish_vad_high_recall.yaml
 python train_microwakeword.py --config configs/polish_vad_low_fp.yaml
 python train_microwakeword.py --config configs/polish_vad_low_fp_stable.yaml
 python train_microwakeword.py --config configs/polish_vad_public_large.yaml
+python train_microwakeword.py --config configs/polish_vad_public_large_bgneg.yaml
 python train_microwakeword.py --config configs/polish_vad_public_hybrid.yaml
 python train_microwakeword.py --config configs/polish_vad_public_xlarge.yaml
 python train_microwakeword.py --config configs/polish_vad_strict.yaml
@@ -93,8 +95,9 @@ The VAD flow:
 2. downloads official negative feature packs used by microWakeWord
 3. bootstraps public Polish speech data and extra ambient/noise corpora
 4. prepares positive speech features
-5. trains a custom model
-6. exports `.tflite` and `.json` for ESPHome
+5. optionally prepares an extra negative `mmap` pack from public background audio
+6. trains a custom model
+7. exports `.tflite` and `.json` for ESPHome
 
 If you already created `.venv` before a dependency fix landed, refresh the helper packages with:
 

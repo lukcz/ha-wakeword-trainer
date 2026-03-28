@@ -199,12 +199,20 @@ def _positive_features_dir(cfg: dict) -> Path:
     return _project_dir(cfg) / "generated_augmented_features"
 
 
+def _background_negative_features_dir(cfg: dict) -> Path:
+    return _project_dir(cfg) / "generated_background_negative_features"
+
+
 def _negative_datasets_dir(cfg: dict) -> Path:
     return _project_dir(cfg) / "negative_datasets"
 
 
 def _staged_positive_dir(cfg: dict) -> Path:
     return _project_dir(cfg) / "staged_positive_audio"
+
+
+def _staged_background_dir(cfg: dict) -> Path:
+    return _project_dir(cfg) / "staged_background_audio"
 
 
 def _training_dir(cfg: dict) -> Path:
@@ -772,9 +780,12 @@ def _resolve_positive_sources(cfg: dict) -> list[Path]:
     return unique_sources
 
 
-def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
-    staged_dir = _staged_positive_dir(cfg)
-    manifest_path = _project_dir(cfg) / "staged_positive_sources.json"
+def _stage_audio_sources(
+    staged_dir: Path,
+    manifest_path: Path,
+    source_dirs: list[Path],
+    label: str,
+) -> Path:
     source_manifest = [str(path) for path in source_dirs]
 
     if staged_dir.exists() and manifest_path.exists():
@@ -783,7 +794,7 @@ def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
         except json.JSONDecodeError:
             current_manifest = None
         if current_manifest == source_manifest and _safe_iter_audio_files(staged_dir):
-            log.info("  Using staged positive audio at %s", staged_dir)
+            log.info("  Using staged %s audio at %s", label, staged_dir)
             return staged_dir
 
     if staged_dir.exists():
@@ -799,11 +810,54 @@ def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
             index += 1
 
     if index == 0:
-        raise ValueError("No positive audio files were found in the configured source directories")
+        raise ValueError(f"No {label} audio files were found in the configured source directories")
 
     manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
-    log.info("  Staged %d positive audio files into %s", index, staged_dir)
+    log.info("  Staged %d %s audio files into %s", index, label, staged_dir)
     return staged_dir
+
+
+def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
+    return _stage_audio_sources(
+        staged_dir=_staged_positive_dir(cfg),
+        manifest_path=_project_dir(cfg) / "staged_positive_sources.json",
+        source_dirs=source_dirs,
+        label="positive",
+    )
+
+
+def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
+    return _stage_audio_sources(
+        staged_dir=_staged_background_dir(cfg),
+        manifest_path=_project_dir(cfg) / "staged_background_sources.json",
+        source_dirs=source_dirs,
+        label="background",
+    )
+
+
+def _generated_background_negatives_cfg(cfg: dict) -> dict:
+    return cfg.get("generated_background_negatives", {}) or {}
+
+
+def _generated_background_negatives_enabled(cfg: dict) -> bool:
+    return _task(cfg) == "vad" and bool(_generated_background_negatives_cfg(cfg).get("enabled", False))
+
+
+def _generated_background_negative_manifest_path(cfg: dict) -> Path:
+    return _project_dir(cfg) / "generated_background_negative_features.json"
+
+
+def _has_any_mmap_dir(root: Path) -> bool:
+    return any(root.glob("**/*_mmap"))
+
+
+def _background_negative_pack_ready(root: Path) -> bool:
+    required = (
+        root / "training",
+        root / "validation_ambient",
+        root / "testing_ambient",
+    )
+    return all(directory.exists() and _has_any_mmap_dir(directory) for directory in required)
 
 
 def step_check_env() -> bool:
@@ -1275,6 +1329,36 @@ def step_audit_validation() -> bool:
     if not found_any:
         log.warning("  No negative feature pack stats were found under %s", neg_root)
 
+    generated_background_root = _background_negative_features_dir(cfg)
+    if _generated_background_negatives_enabled(cfg):
+        counts = {
+            "training": 0,
+            "validation_ambient": 0,
+            "testing_ambient": 0,
+        }
+        if _background_negative_pack_ready(generated_background_root):
+            for label, directory in (
+                ("training", generated_background_root / "training"),
+                ("validation_ambient", generated_background_root / "validation_ambient"),
+                ("testing_ambient", generated_background_root / "testing_ambient"),
+            ):
+                for mmap_path in directory.glob("**/*_mmap/"):
+                    try:
+                        counts[label] += len(RaggedMmap(str(mmap_path)))
+                    except Exception as exc:
+                        log.warning("  Could not inspect %s: %s", mmap_path, exc)
+            log.info(
+                "  Generated background negatives: training=%d validation_ambient=%d testing_ambient=%d",
+                counts["training"],
+                counts["validation_ambient"],
+                counts["testing_ambient"],
+            )
+        else:
+            log.warning(
+                "  Generated background negatives are enabled, but no mmap pack was found under %s",
+                generated_background_root,
+            )
+
     suspicious = []
     if any(path_overlaps.values()):
         suspicious.append("exact path overlap between positive splits")
@@ -1370,6 +1454,111 @@ def step_generate_positive_features() -> bool:
     return True
 
 
+def step_generate_background_negative_features() -> bool:
+    if not _check_micro_wake_word_import():
+        return False
+
+    cfg = _load_config()
+    neg_cfg = _generated_background_negatives_cfg(cfg)
+    if not _generated_background_negatives_enabled(cfg):
+        log.info("  Generated background negatives are disabled for this config")
+        return True
+
+    source_dirs = [Path(path) for path in _resolve_background_audio_paths(cfg)]
+    if not source_dirs:
+        log.warning("  No background audio directories were found for generated negative features.")
+        return True
+
+    staged_dir = _stage_background_sources(cfg, source_dirs)
+    features_dir = _background_negative_features_dir(cfg)
+    manifest_path = _generated_background_negative_manifest_path(cfg)
+
+    feature_manifest = {
+        "sources": [str(path) for path in source_dirs],
+        "duration_s": float(neg_cfg.get("duration_s", cfg.get("augmentation", {}).get("duration_s", 3.2))),
+        "training_repeat": int(neg_cfg.get("training_repeat", 1)),
+        "training_slide_frames": int(neg_cfg.get("training_slide_frames", 5)),
+        "eval_slide_frames": int(neg_cfg.get("eval_slide_frames", 1)),
+        "random_split_seed": int(cfg.get("random_split_seed", 10)),
+        "split_count": float(cfg.get("split_count", 0.1)),
+        "probabilities": dict(neg_cfg.get("probabilities", {})),
+        "use_rirs": bool(neg_cfg.get("use_rirs", False)),
+    }
+
+    if _background_negative_pack_ready(features_dir) and manifest_path.exists():
+        try:
+            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            current_manifest = None
+        if current_manifest == feature_manifest:
+            log.info("  Generated background negative features already present at %s", features_dir)
+            return True
+
+    if features_dir.exists():
+        shutil.rmtree(features_dir)
+    features_dir.mkdir(parents=True, exist_ok=True)
+
+    from mmap_ninja.ragged import RaggedMmap
+    from microwakeword.audio.augmentation import Augmentation
+    from microwakeword.audio.clips import Clips
+    from microwakeword.audio.spectrograms import SpectrogramGeneration
+
+    clips = Clips(
+        input_directory=str(staged_dir),
+        file_pattern="*.*",
+        max_clip_duration_s=None,
+        remove_silence=False,
+        random_split_seed=int(cfg.get("random_split_seed", 10)),
+        split_count=float(cfg.get("split_count", 0.1)),
+    )
+
+    impulse_paths: list[str] = []
+    if bool(neg_cfg.get("use_rirs", False)) and _dir_has_entries(DATA_DIR / "mit_rirs"):
+        impulse_paths = [str(DATA_DIR / "mit_rirs")]
+
+    augmenter = Augmentation(
+        augmentation_duration_s=float(neg_cfg.get("duration_s", cfg.get("augmentation", {}).get("duration_s", 3.2))),
+        augmentation_probabilities=_resolve_augmentation_probabilities(neg_cfg.get("probabilities", {})),
+        impulse_paths=impulse_paths,
+        background_paths=[],
+        background_min_snr_db=0,
+        background_max_snr_db=0,
+        min_jitter_s=0.0,
+        max_jitter_s=0.0,
+    )
+
+    split_plan = (
+        ("training", "train", int(neg_cfg.get("training_repeat", 1)), int(neg_cfg.get("training_slide_frames", 5))),
+        ("validation_ambient", "validation", 1, int(neg_cfg.get("eval_slide_frames", 1))),
+        ("testing_ambient", "test", 1, int(neg_cfg.get("eval_slide_frames", 1))),
+    )
+
+    for split_name, clip_split, repetition, slide_frames in split_plan:
+        out_dir = features_dir / split_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        spectrograms = SpectrogramGeneration(
+            clips=clips,
+            augmenter=augmenter,
+            slide_frames=slide_frames,
+            step_ms=10,
+        )
+
+        RaggedMmap.from_generator(
+            out_dir=str(out_dir / "background_mmap"),
+            sample_generator=spectrograms.spectrogram_generator(
+                split=clip_split,
+                repeat=repetition,
+            ),
+            batch_size=100,
+            verbose=True,
+        )
+
+    manifest_path.write_text(json.dumps(feature_manifest, indent=2) + "\n", encoding="utf-8")
+    log.info("  Generated background negative feature datasets at %s", features_dir)
+    return True
+
+
 def _write_training_config(cfg: dict) -> Path:
     feature_root = _positive_features_dir(cfg)
     neg_root = _negative_datasets_dir(cfg)
@@ -1386,6 +1575,20 @@ def _write_training_config(cfg: dict) -> Path:
                 "penalty_weight": 1.0,
                 "truth": False,
                 "truncation_strategy": str(truncation.get(name, "split" if name == "dinner_party_eval" else "random")),
+                "type": "mmap",
+            }
+        )
+
+    generated_background_root = _background_negative_features_dir(cfg)
+    generated_background_cfg = _generated_background_negatives_cfg(cfg)
+    if _generated_background_negatives_enabled(cfg) and _background_negative_pack_ready(generated_background_root):
+        negative_entries.append(
+            {
+                "features_dir": str(generated_background_root),
+                "sampling_weight": float(generated_background_cfg.get("sampling_weight", 8.0)),
+                "penalty_weight": 1.0,
+                "truth": False,
+                "truncation_strategy": str(generated_background_cfg.get("truncation_strategy", "random")),
                 "type": "mmap",
             }
         )
@@ -1442,6 +1645,11 @@ def step_train() -> bool:
         neg_root = _negative_datasets_dir(cfg)
         for name in _negative_feature_names(cfg):
             _download_negative_feature_pack(neg_root, name)
+
+        if _generated_background_negatives_enabled(cfg) and not _background_negative_pack_ready(_background_negative_features_dir(cfg)):
+            log.info("  Generated background negative features are missing; building them before training.")
+            if not step_generate_background_negative_features():
+                return False
 
         training_config = _write_training_config(cfg)
         cmd = [
@@ -1553,6 +1761,7 @@ STEPS: list[tuple[str, Callable[[], bool], str]] = [
     ("download-assets", step_download_assets, "Download augmentation data and negative feature packs"),
     ("prepare-positives", step_prepare_positives, "Prepare positive speech or wake-word samples"),
     ("generate-positive-features", step_generate_positive_features, "Generate positive Ragged Mmap features"),
+    ("generate-background-negative-features", step_generate_background_negative_features, "Generate negative Ragged Mmap features from background audio"),
     ("audit-validation", step_audit_validation, "Audit split integrity and ambient validation data"),
     ("train", step_train, "Train and quantize the microWakeWord model"),
     ("export", step_export, "Export the TFLite model and ESPHome manifest"),
