@@ -232,7 +232,7 @@ def _resolve_path(path_str: str) -> Path:
 
 
 def _iter_audio_files(root: Path) -> list[Path]:
-    exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+    exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus"}
     return [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in exts]
 
 
@@ -632,6 +632,23 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
     _download_hf_audio_dataset(merged)
 
 
+def _download_voxpopuli_dataset(dataset_cfg: dict) -> None:
+    merged = {
+        "hf_repo": "facebook/voxpopuli",
+        "hf_config": dataset_cfg.get("hf_config", "pl"),
+        "output_dir": dataset_cfg.get("output_dir", "data/voxpopuli_pl"),
+        "split": dataset_cfg.get("split", "train"),
+        "max_clips": dataset_cfg.get("max_clips", 3000),
+        "prefix": dataset_cfg.get("prefix", "voxpopuli"),
+        "streaming": dataset_cfg.get("streaming", True),
+        "fallback_to_non_streaming": dataset_cfg.get("fallback_to_non_streaming", True),
+        "audio_column": dataset_cfg.get("audio_column", "audio"),
+    }
+    if "io_workers" in dataset_cfg:
+        merged["io_workers"] = dataset_cfg["io_workers"]
+    _download_hf_audio_dataset(merged)
+
+
 def _download_wham_dataset(dataset_cfg: dict) -> None:
     merged = {
         "hf_repo": dataset_cfg.get("hf_repo", "philgzl/wham"),
@@ -649,6 +666,73 @@ def _download_wham_dataset(dataset_cfg: dict) -> None:
     if "io_workers" in dataset_cfg:
         merged["io_workers"] = dataset_cfg["io_workers"]
     _download_hf_audio_dataset(merged)
+
+
+def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
+    output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/mls_polish")))
+    max_clips = int(dataset_cfg.get("max_clips", 4000))
+    archive_dir = DATA_DIR / "_archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / "mls_polish.tar.gz"
+
+    if _dir_has_entries(output_dir):
+        log.info("  MLS Polish already present at %s", output_dir)
+        return
+
+    _download(
+        str(dataset_cfg.get("url", "https://openslr.org/resources/94/mls_polish.tar.gz")),
+        archive_path,
+        "MLS Polish corpus (OpenSLR)",
+    )
+
+    extract_dir = archive_dir / "mls_polish_extract"
+    _reset_dir(extract_dir)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(extract_dir)
+
+    root = extract_dir / "mls_polish"
+    if not root.exists():
+        raise FileNotFoundError(f"Expected MLS Polish root not found in archive: {root}")
+
+    audio_root = root / "train" / "audio"
+    if not audio_root.exists():
+        raise FileNotFoundError(f"Expected MLS Polish audio root not found: {audio_root}")
+
+    _reset_dir(output_dir)
+    count = 0
+    for audio_file in _safe_iter_audio_files(audio_root):
+        if count >= max_clips:
+            break
+        dest = output_dir / f"mls_polish_{count:06d}{audio_file.suffix.lower()}"
+        shutil.copy2(audio_file, dest)
+        count += 1
+
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    log.info("  Saved %d MLS Polish clips to %s", count, output_dir)
+
+
+def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
+    output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/sounds_of_home")))
+    archive_dir = DATA_DIR / "_archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / "sounds_of_home_light.zip"
+
+    if _dir_has_entries(output_dir):
+        log.info("  Sounds of Home already present at %s", output_dir)
+        return
+
+    _download(
+        str(dataset_cfg.get("url", "https://www.cvssp.org/data/ai4s/sounds_of_home/VITALISE_data_light.zip")),
+        archive_path,
+        "Sounds of Home dataset (light)",
+    )
+
+    _reset_dir(output_dir)
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(output_dir)
+
+    file_count = len(_safe_iter_audio_files(output_dir))
+    log.info("  Extracted %d Sounds of Home audio files into %s", file_count, output_dir)
 
 
 def _download_bigos_dataset(dataset_cfg: dict) -> None:
@@ -706,6 +790,10 @@ def _bootstrap_positive_speech_datasets(cfg: dict) -> None:
                 _download_bigos_dataset(dataset_cfg)
             elif kind == "common_voice":
                 _download_common_voice_dataset(dataset_cfg)
+            elif kind == "voxpopuli":
+                _download_voxpopuli_dataset(dataset_cfg)
+            elif kind == "mls_polish":
+                _download_mls_polish_dataset(dataset_cfg)
             elif kind == "wham":
                 _download_wham_dataset(dataset_cfg)
             elif kind == "hf_audio":
@@ -746,6 +834,8 @@ def _bootstrap_background_audio_datasets(cfg: dict) -> None:
                 _download_wham_dataset(dataset_cfg)
             elif kind == "musan_openslr":
                 _download_musan_openslr(_resolve_path(str(dataset_cfg.get("output_dir", "data/musan_noise_music"))))
+            elif kind == "sounds_of_home":
+                _download_sounds_of_home_dataset(dataset_cfg)
             else:
                 raise ValueError(f"Unsupported background dataset kind: {kind}")
         except Exception as exc:

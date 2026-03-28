@@ -47,6 +47,7 @@ Alternative Polish VAD presets:
 - `configs/polish_vad_low_fp_stable.yaml`: low-FP preset with gentler learning-rate decay for more stable early checkpoints
 - `configs/polish_vad_public_large.yaml`: larger public-only bootstrap with more Polish speech and more background/noise clips
 - `configs/polish_vad_public_large_segpos.yaml`: `public_large` plus safe post-split segmentation of long positive clips and segmented background augmentation
+- `configs/polish_vad_public_research.yaml`: research preset that adds VoxPopuli PL, MLS Polish, and optional Sounds of Home negatives
 - `configs/polish_vad_public_large_v2.yaml`: tuned `public_large` with shorter schedule, denser evals, and slightly harder default negatives
 - `configs/polish_vad_public_large_balanced_v2.yaml`: `public_large` with a very light generated background-negative pack for a more cautious balanced run
 - `configs/polish_vad_public_large_bgneg.yaml`: `public_large` plus a generated negative mmap pack built from public background audio
@@ -68,6 +69,7 @@ python train_microwakeword.py --config configs/polish_vad_low_fp.yaml
 python train_microwakeword.py --config configs/polish_vad_low_fp_stable.yaml
 python train_microwakeword.py --config configs/polish_vad_public_large.yaml
 python train_microwakeword.py --config configs/polish_vad_public_large_segpos.yaml
+python train_microwakeword.py --config configs/polish_vad_public_research.yaml
 python train_microwakeword.py --config configs/polish_vad_public_large_v2.yaml
 python train_microwakeword.py --config configs/polish_vad_public_large_balanced_v2.yaml
 python train_microwakeword.py --config configs/polish_vad_public_large_bgneg.yaml
@@ -133,10 +135,13 @@ By default the bootstrap tries:
 - `amu-cai/pl-asr-bigos-v2` if you have access
 - `mozilla-foundation/common_voice_16_0` for `pl`
 - `google/fleurs` for `pl_pl`
+- `facebook/voxpopuli` for `pl`
+- `MLS Polish` from OpenSLR
 - `bond005/audioset-nonspeech` for extra nonspeech background clips
 - `haydarkadioglu/speech-noise-dataset` filtered to `noise_only`
 - `philgzl/wham` as an optional higher-quality urban-noise source
 - `MUSAN` from OpenSLR filtered to `music` and `noise`
+- `Sounds of Home` as an optional residential speech-removed background source
 - any local datasets you place in `data/mc_speech` or `data/pl_speech`
 
 `AxonData/speech-free-background-noise` is no longer enabled by default in the
