@@ -1703,7 +1703,10 @@ def step_generate_positive_features() -> bool:
                 max_clip_duration_s=None,
                 remove_silence=bool(cfg.get("remove_silence", False)),
                 random_split_seed=int(cfg.get("random_split_seed", 10)),
-                split_count=0.0,
+                # Upstream Clips requires a positive holdout size, even when we already
+                # split source files ourselves. Using an integer of 1 keeps the
+                # secondary split negligible while avoiding leakage across source files.
+                split_count=1,
             )
 
         spectrograms = SpectrogramGeneration(
