@@ -1504,6 +1504,7 @@ def _stage_audio_sources(
     manifest_path: Path,
     source_dirs: list[Path],
     label: str,
+    file_filter: Callable[[Path], bool] | None = None,
 ) -> Path:
     source_manifest = [str(path) for path in source_dirs]
 
@@ -1521,9 +1522,13 @@ def _stage_audio_sources(
     staged_dir.mkdir(parents=True, exist_ok=True)
 
     index = 0
+    skipped = 0
     for source_dir in source_dirs:
         files = _safe_iter_audio_files(source_dir)
         for audio_file in files:
+            if file_filter is not None and not file_filter(audio_file):
+                skipped += 1
+                continue
             dest = staged_dir / f"{source_dir.name}_{index:06d}{audio_file.suffix.lower()}"
             _link_or_copy(audio_file, dest)
             index += 1
@@ -1533,6 +1538,8 @@ def _stage_audio_sources(
 
     manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
     log.info("  Staged %d %s audio files into %s", index, label, staged_dir)
+    if skipped:
+        log.warning("  Skipped %d unreadable %s audio files during staging", skipped, label)
     return staged_dir
 
 
@@ -1552,6 +1559,7 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
             manifest_path=_project_dir(cfg) / "staged_background_sources.json",
             source_dirs=source_dirs,
             label="background",
+            file_filter=_is_background_audio_usable,
         )
 
     staged_dir = _staged_background_dir(cfg)
@@ -1578,22 +1586,32 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
     staged_dir.mkdir(parents=True, exist_ok=True)
 
     count = 0
+    skipped = 0
     for source_dir in source_dirs:
         for audio_file in _safe_iter_audio_files(source_dir):
-            count += _segment_file_into_dir(
-                audio_file,
-                staged_dir,
-                prefix=f"{source_dir.name}_{count:06d}",
-                segment_duration_s=float(seg_cfg.get("segment_duration_s", 5.0)),
-                segment_overlap_s=float(seg_cfg.get("segment_overlap_s", 2.5)),
-                min_segment_duration_s=float(seg_cfg.get("min_segment_duration_s", 4.0)),
-            )
+            try:
+                if not _is_background_audio_usable(audio_file):
+                    skipped += 1
+                    continue
+                count += _segment_file_into_dir(
+                    audio_file,
+                    staged_dir,
+                    prefix=f"{source_dir.name}_{count:06d}",
+                    segment_duration_s=float(seg_cfg.get("segment_duration_s", 5.0)),
+                    segment_overlap_s=float(seg_cfg.get("segment_overlap_s", 2.5)),
+                    min_segment_duration_s=float(seg_cfg.get("min_segment_duration_s", 4.0)),
+                )
+            except Exception as exc:
+                skipped += 1
+                log.warning("  Skipping unreadable background audio file %s: %s", audio_file, exc)
 
     if count == 0:
         raise ValueError("No background audio files were found in the configured source directories")
 
     manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
     log.info("  Segmented %d background audio clips into %s", count, staged_dir)
+    if skipped:
+        log.warning("  Skipped %d unreadable background source files during segmentation", skipped)
     return staged_dir
 
 
@@ -1646,6 +1664,24 @@ def _extract_audio_from_file(path: Path) -> tuple["np.ndarray", int]:
     if samples.ndim > 1:
         samples = np.mean(samples, axis=-1, dtype="float32")
     return np.asarray(samples, dtype="float32"), int(sampling_rate)
+
+
+def _is_background_audio_usable(path: Path) -> bool:
+    import soundfile as sf
+
+    try:
+        sf.info(str(path))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import audioread
+
+        with audioread.audio_open(str(path)):
+            return True
+    except Exception:
+        return False
 
 
 def _segment_file_into_dir(
