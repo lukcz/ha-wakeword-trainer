@@ -99,6 +99,28 @@ def _finish_inline_progress() -> None:
     sys.stdout.flush()
 
 
+def _extract_zip_with_external_tools(archive_path: Path, extract_dir: Path) -> bool:
+    candidates = [
+        ["7z", "x", str(archive_path), f"-o{extract_dir}", "-y"],
+        ["7zz", "x", str(archive_path), f"-o{extract_dir}", "-y"],
+        ["bsdtar", "-xf", str(archive_path), "-C", str(extract_dir)],
+        ["unzip", "-o", str(archive_path), "-d", str(extract_dir)],
+    ]
+
+    for cmd in candidates:
+        executable = shutil.which(cmd[0])
+        if not executable:
+            continue
+        try:
+            subprocess.check_call([executable, *cmd[1:]])
+            return True
+        except subprocess.CalledProcessError as exc:
+            log.warning("  External extractor %s failed for %s: %s", cmd[0], archive_path.name, exc)
+            _reset_dir(extract_dir)
+
+    return False
+
+
 def _download(
     url: str,
     dest: Path,
@@ -832,14 +854,25 @@ def _extract_archive(archive_path: Path, extract_dir: Path) -> None:
     _reset_dir(extract_dir)
     archive_str = str(archive_path)
     if zipfile.is_zipfile(archive_path):
-        with zipfile.ZipFile(archive_path) as archive:
-            archive.extractall(extract_dir)
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.extractall(extract_dir)
+        except (NotImplementedError, RuntimeError, zipfile.BadZipFile) as exc:
+            log.warning("  Python zip extraction failed for %s: %s", archive_path.name, exc)
+            if not _extract_zip_with_external_tools(archive_path, extract_dir):
+                raise
         return
     if tarfile.is_tarfile(archive_path):
         with tarfile.open(archive_path, "r:*") as archive:
             archive.extractall(extract_dir)
         return
-    shutil.unpack_archive(archive_str, str(extract_dir))
+    try:
+        shutil.unpack_archive(archive_str, str(extract_dir))
+    except (shutil.ReadError, ValueError) as exc:
+        log.warning("  Generic archive extraction failed for %s: %s", archive_path.name, exc)
+        if archive_path.suffix.lower() == ".zip" and _extract_zip_with_external_tools(archive_path, extract_dir):
+            return
+        raise
 
 
 def _find_common_voice_dataset_root(extract_dir: Path) -> Path:
@@ -990,9 +1023,7 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
         "Sounds of Home dataset (light)",
     )
 
-    _reset_dir(output_dir)
-    with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(output_dir)
+    _extract_archive(archive_path, output_dir)
 
     file_count = len(_safe_iter_audio_files(output_dir))
     log.info("  Extracted %d Sounds of Home audio files into %s", file_count, output_dir)
