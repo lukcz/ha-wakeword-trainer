@@ -113,6 +113,7 @@ def _extract_zip_with_external_tools(archive_path: Path, extract_dir: Path) -> b
         if not executable:
             continue
         try:
+            log.info("  Extracting %s with external tool %s", archive_path.name, cmd[0])
             subprocess.check_call([executable, *cmd[1:]])
             return True
         except subprocess.CalledProcessError as exc:
@@ -120,6 +121,92 @@ def _extract_zip_with_external_tools(archive_path: Path, extract_dir: Path) -> b
             _reset_dir(extract_dir)
 
     return False
+
+
+def _extract_members_with_progress(
+    *,
+    description: str,
+    members: list,
+    extract_one: Callable[[object], None],
+    size_getter: Callable[[object], int],
+) -> None:
+    total_members = len(members)
+    total_bytes = sum(max(0, int(size_getter(member))) for member in members)
+    if total_members == 0:
+        log.info("  Archive %s is empty", description)
+        return
+
+    log.info(
+        "  Extracting %s: %d entries totaling %s",
+        description,
+        total_members,
+        _format_bytes(total_bytes),
+    )
+
+    extracted_members = 0
+    extracted_bytes = 0
+    start_ts = time.time()
+    last_log_ts = start_ts
+    progress_log_interval_s = 5.0
+    last_logged_bucket = -1
+    inline_progress = _supports_inline_progress()
+
+    for member in members:
+        extract_one(member)
+        extracted_members += 1
+        extracted_bytes += max(0, int(size_getter(member)))
+
+        now = time.time()
+        should_log = False
+        if total_bytes > 0:
+            bucket = int((extracted_bytes / total_bytes) * 100)
+            if bucket > last_logged_bucket:
+                last_logged_bucket = bucket
+                should_log = True
+        elif extracted_members == total_members:
+            should_log = True
+
+        if now - last_log_ts >= progress_log_interval_s:
+            should_log = True
+
+        if should_log:
+            elapsed = max(now - start_ts, 0.001)
+            rate = extracted_bytes / elapsed if extracted_bytes > 0 else 0.0
+            if total_bytes > 0:
+                pct = min(100.0, (extracted_bytes / total_bytes) * 100.0)
+                remaining_bytes = max(total_bytes - extracted_bytes, 0)
+                eta_seconds = remaining_bytes / rate if rate > 0 else 0.0
+                progress_message = (
+                    f"  Extracting {description}: "
+                    f"{extracted_members}/{total_members} files, "
+                    f"{_format_bytes(extracted_bytes)} / {_format_bytes(total_bytes)} "
+                    f"({pct:.1f}%) at {_format_bytes(int(rate))}/s, ETA {_format_duration(eta_seconds)}"
+                )
+            else:
+                progress_message = (
+                    f"  Extracting {description}: "
+                    f"{extracted_members}/{total_members} files"
+                )
+
+            if inline_progress:
+                _write_inline_progress(progress_message)
+            else:
+                log.info(progress_message)
+            last_log_ts = now
+
+    if inline_progress:
+        _finish_inline_progress()
+
+    elapsed = max(time.time() - start_ts, 0.001)
+    rate = extracted_bytes / elapsed if extracted_bytes > 0 else 0.0
+    log.info(
+        "  Finished extracting %s: %d entries, %s in %.1fs (%s/s)",
+        description,
+        total_members,
+        _format_bytes(extracted_bytes),
+        elapsed,
+        _format_bytes(int(rate)),
+    )
 
 
 def _download(
@@ -791,7 +878,7 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
     )
 
     extract_dir = archive_dir / f"extract_{locale}_{version.replace('.', '_')}"
-    _extract_archive(Path(archive_path), extract_dir)
+    _extract_archive(Path(archive_path), extract_dir, description=f"Common Voice {version} ({locale}) archive")
     dataset_root = _find_common_voice_dataset_root(extract_dir)
     _reset_dir(output_dir)
     count = _copy_common_voice_audio_subset(dataset_root, output_dir, prefix=prefix, max_clips=max_clips)
@@ -851,32 +938,53 @@ def _resolve_common_voice_dataset_id(*, locale: str, version: str, dataset_cfg: 
     raise RuntimeError(f"Could not resolve Common Voice dataset id for locale '{locale}' and version '{version}' from Mozilla Data Collective.")
 
 
-def _extract_archive(archive_path: Path, extract_dir: Path) -> None:
-    _reset_dir(extract_dir)
+def _extract_archive(archive_path: Path, extract_dir: Path, description: str | None = None, reset_dir: bool = True) -> None:
+    if reset_dir:
+        _reset_dir(extract_dir)
+    else:
+        extract_dir.mkdir(parents=True, exist_ok=True)
+    label = description or archive_path.name
     archive_str = str(archive_path)
     if zipfile.is_zipfile(archive_path):
         try:
             with zipfile.ZipFile(archive_path) as archive:
-                archive.extractall(extract_dir)
+                _extract_members_with_progress(
+                    description=label,
+                    members=archive.infolist(),
+                    extract_one=lambda member: archive.extract(member, path=extract_dir),
+                    size_getter=lambda member: getattr(member, "file_size", 0),
+                )
         except (NotImplementedError, RuntimeError, zipfile.BadZipFile) as exc:
             log.warning("  Python zip extraction failed for %s: %s", archive_path.name, exc)
             if _ensure_python_module("zipfile_inflate64", ZIPFILE_INFLATE64_PIP_SPEC):
                 import zipfile_inflate64  # noqa: F401
 
-                _reset_dir(extract_dir)
+                if reset_dir:
+                    _reset_dir(extract_dir)
                 try:
                     with zipfile.ZipFile(archive_path) as archive:
-                        archive.extractall(extract_dir)
+                        _extract_members_with_progress(
+                            description=label,
+                            members=archive.infolist(),
+                            extract_one=lambda member: archive.extract(member, path=extract_dir),
+                            size_getter=lambda member: getattr(member, "file_size", 0),
+                        )
                     return
                 except (NotImplementedError, RuntimeError, zipfile.BadZipFile) as inflate_exc:
                     log.warning("  zipfile-inflate64 extraction failed for %s: %s", archive_path.name, inflate_exc)
-                    _reset_dir(extract_dir)
+                    if reset_dir:
+                        _reset_dir(extract_dir)
             if not _extract_zip_with_external_tools(archive_path, extract_dir):
                 raise
         return
     if tarfile.is_tarfile(archive_path):
         with tarfile.open(archive_path, "r:*") as archive:
-            archive.extractall(extract_dir)
+            _extract_members_with_progress(
+                description=label,
+                members=archive.getmembers(),
+                extract_one=lambda member: archive.extract(member, path=extract_dir),
+                size_getter=lambda member: getattr(member, "size", 0),
+            )
         return
     try:
         shutil.unpack_archive(archive_str, str(extract_dir))
@@ -994,9 +1102,7 @@ def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
     )
 
     extract_dir = archive_dir / "mls_polish_extract"
-    _reset_dir(extract_dir)
-    with tarfile.open(archive_path, "r:gz") as archive:
-        archive.extractall(extract_dir)
+    _extract_archive(archive_path, extract_dir, description="MLS Polish corpus archive")
 
     root = extract_dir / "mls_polish"
     if not root.exists():
@@ -1035,7 +1141,7 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
         "Sounds of Home dataset (light)",
     )
 
-    _extract_archive(archive_path, output_dir)
+    _extract_archive(archive_path, output_dir, description="Sounds of Home dataset (light)")
 
     file_count = len(_safe_iter_audio_files(output_dir))
     log.info("  Extracted %d Sounds of Home audio files into %s", file_count, output_dir)
@@ -1633,9 +1739,7 @@ def _download_negative_feature_pack(dest_root: Path, name: str) -> None:
         zip_path,
         f"negative feature pack {name}",
     )
-    dest_root.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(dest_root)
+    _extract_archive(zip_path, dest_root, description=f"negative feature pack {name}", reset_dir=False)
 
     valid, reason = validate_pack(target_dir)
     if not valid:
