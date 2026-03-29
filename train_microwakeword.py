@@ -2041,12 +2041,15 @@ def _base_background_audio_paths(cfg: dict) -> list[str]:
 
 def _resolve_background_audio_paths(cfg: dict) -> list[str]:
     resolved = _base_background_audio_paths(cfg)
+    if not resolved:
+        return resolved
 
-    if _background_segmentation_enabled(cfg) and resolved:
-        staged = _stage_background_sources(cfg, [Path(path) for path in resolved])
-        return [str(staged)]
-
-    return resolved
+    # Always stage and validate background audio before handing paths to
+    # audiomentations. This keeps unreadable/unsupported files out of runtime
+    # augmentation regardless of whether explicit background segmentation is
+    # enabled for the config.
+    staged = _stage_background_sources(cfg, [Path(path) for path in resolved])
+    return [str(staged)]
 
 
 def step_download_assets() -> bool:
