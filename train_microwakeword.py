@@ -77,6 +77,24 @@ def _format_duration(seconds: float) -> str:
     return f"{secs:d}s"
 
 
+def _supports_inline_progress() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_INLINE_PROGRESS")
+
+
+def _write_inline_progress(message: str) -> None:
+    if not _supports_inline_progress():
+        return
+    sys.stdout.write(f"\r{message}")
+    sys.stdout.flush()
+
+
+def _finish_inline_progress() -> None:
+    if not _supports_inline_progress():
+        return
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _download(
     url: str,
     dest: Path,
@@ -111,6 +129,7 @@ def _download(
                 last_log_ts = start_ts
                 last_logged_bucket = -1
                 progress_log_interval_s = 5.0
+                inline_progress = _supports_inline_progress()
                 with open(tmp, "wb") as handle:
                     for chunk in response.iter_content(chunk_size=1 << 20):
                         if chunk:
@@ -136,23 +155,41 @@ def _download(
                                     pct = min(100.0, (bytes_written / total_bytes) * 100.0)
                                     remaining_bytes = max(total_bytes - bytes_written, 0)
                                     eta_seconds = remaining_bytes / rate if rate > 0 else 0.0
-                                    log.info(
-                                        "  Download progress for %s: %s / %s (%.1f%%) at %s/s, ETA %s",
-                                        description,
-                                        _format_bytes(bytes_written),
-                                        _format_bytes(total_bytes),
-                                        pct,
-                                        _format_bytes(int(rate)),
-                                        _format_duration(eta_seconds),
+                                    progress_message = (
+                                        f"  Download progress for {description}: "
+                                        f"{_format_bytes(bytes_written)} / {_format_bytes(total_bytes)} "
+                                        f"({pct:.1f}%) at {_format_bytes(int(rate))}/s, ETA {_format_duration(eta_seconds)}"
                                     )
+                                    if inline_progress:
+                                        _write_inline_progress(progress_message)
+                                    else:
+                                        log.info(
+                                            "  Download progress for %s: %s / %s (%.1f%%) at %s/s, ETA %s",
+                                            description,
+                                            _format_bytes(bytes_written),
+                                            _format_bytes(total_bytes),
+                                            pct,
+                                            _format_bytes(int(rate)),
+                                            _format_duration(eta_seconds),
+                                        )
                                 else:
-                                    log.info(
-                                        "  Download progress for %s: %s at %s/s",
-                                        description,
-                                        _format_bytes(bytes_written),
-                                        _format_bytes(int(rate)),
+                                    progress_message = (
+                                        f"  Download progress for {description}: "
+                                        f"{_format_bytes(bytes_written)} at {_format_bytes(int(rate))}/s"
                                     )
+                                    if inline_progress:
+                                        _write_inline_progress(progress_message)
+                                    else:
+                                        log.info(
+                                            "  Download progress for %s: %s at %s/s",
+                                            description,
+                                            _format_bytes(bytes_written),
+                                            _format_bytes(int(rate)),
+                                        )
                                 last_log_ts = now
+
+                if inline_progress:
+                    _finish_inline_progress()
 
                 elapsed = max(time.time() - start_ts, 0.001)
                 log.info(
