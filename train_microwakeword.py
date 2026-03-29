@@ -39,6 +39,7 @@ TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
 MDC_PIP_SPEC = "datacollective>=0.4.5"
 ZIPFILE_INFLATE64_PIP_SPEC = "zipfile-inflate64>=0.1"
 COMMON_VOICE_MDC_ORG_URL = "https://datacollective.mozillafoundation.org/organization/cmfh0j9o10006ns07jq45h7xk"
+BOOTSTRAP_MANIFEST_NAME = ".bootstrap_manifest.json"
 
 CONFIG_FILE = DEFAULT_CONFIG
 
@@ -480,6 +481,56 @@ def _dir_has_entries(path: Path) -> bool:
         return False
 
 
+def _audio_file_count(path: Path) -> int:
+    return len(_safe_iter_audio_files(path))
+
+
+def _bootstrap_manifest_path(path: Path) -> Path:
+    return path / BOOTSTRAP_MANIFEST_NAME
+
+
+def _write_bootstrap_manifest(path: Path, *, description: str, expected_audio_files: int, metadata: dict | None = None) -> None:
+    manifest = {
+        "description": description,
+        "expected_audio_files": int(expected_audio_files),
+    }
+    if metadata:
+        manifest["metadata"] = metadata
+    _bootstrap_manifest_path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _bootstrap_audio_dir_verified(path: Path, *, description: str) -> bool:
+    if not path.exists():
+        return False
+
+    manifest_path = _bootstrap_manifest_path(path)
+    if not manifest_path.exists():
+        if _audio_file_count(path) > 0:
+            log.warning("  Existing %s at %s has no bootstrap manifest. Rebuilding to verify completeness.", description, path)
+        return False
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected_audio_files = int(manifest.get("expected_audio_files", 0))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        log.warning("  Bootstrap manifest for %s is invalid. Rebuilding.", path)
+        return False
+
+    actual_audio_files = _audio_file_count(path)
+    if actual_audio_files != expected_audio_files or actual_audio_files == 0:
+        log.warning(
+            "  Existing %s at %s is incomplete (%d/%d audio files). Rebuilding.",
+            description,
+            path,
+            actual_audio_files,
+            expected_audio_files,
+        )
+        return False
+
+    log.info("  Verified existing %s at %s (%d audio files)", description, path, actual_audio_files)
+    return True
+
+
 def _reset_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
@@ -779,8 +830,7 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
     segment_overlap_s = float(dataset_cfg.get("segment_overlap_s", 0.0))
     min_segment_duration_s = dataset_cfg.get("min_segment_duration_s")
 
-    if _dir_has_entries(output_dir):
-        log.info("  HF audio dataset already present at %s", output_dir)
+    if _bootstrap_audio_dir_verified(output_dir, description=f"HF audio dataset {repo}"):
         return
 
     _reset_dir(output_dir)
@@ -818,6 +868,12 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
             min_segment_duration_s=float(min_segment_duration_s) if min_segment_duration_s else None,
         )
 
+    _write_bootstrap_manifest(
+        output_dir,
+        description=f"HF audio dataset {repo}",
+        expected_audio_files=count,
+        metadata={"repo": repo, "split": split},
+    )
     log.info("  Saved %d clips from %s to %s", count, repo, output_dir)
 
 
@@ -857,8 +913,7 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
     archive_dir = DATA_DIR / "_archives" / "common_voice"
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    if _dir_has_entries(output_dir):
-        log.info("  Common Voice already present at %s", output_dir)
+    if _bootstrap_audio_dir_verified(output_dir, description="Common Voice dataset"):
         return
 
     if not os.environ.get("MDC_API_KEY"):
@@ -882,6 +937,12 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
     dataset_root = _find_common_voice_dataset_root(extract_dir)
     _reset_dir(output_dir)
     count = _copy_common_voice_audio_subset(dataset_root, output_dir, prefix=prefix, max_clips=max_clips)
+    _write_bootstrap_manifest(
+        output_dir,
+        description="Common Voice dataset",
+        expected_audio_files=count,
+        metadata={"locale": locale, "version": version, "dataset_id": dataset_id},
+    )
     shutil.rmtree(extract_dir, ignore_errors=True)
     log.info("  Saved %d Common Voice clips to %s", count, output_dir)
 
@@ -1091,8 +1152,7 @@ def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / "mls_polish.tar.gz"
 
-    if _dir_has_entries(output_dir):
-        log.info("  MLS Polish already present at %s", output_dir)
+    if _bootstrap_audio_dir_verified(output_dir, description="MLS Polish dataset"):
         return
 
     _download(
@@ -1121,6 +1181,12 @@ def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
         shutil.copy2(audio_file, dest)
         count += 1
 
+    _write_bootstrap_manifest(
+        output_dir,
+        description="MLS Polish dataset",
+        expected_audio_files=count,
+        metadata={"max_clips": max_clips},
+    )
     shutil.rmtree(extract_dir, ignore_errors=True)
     log.info("  Saved %d MLS Polish clips to %s", count, output_dir)
 
@@ -1131,8 +1197,7 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / "sounds_of_home_light.zip"
 
-    if _dir_has_entries(output_dir):
-        log.info("  Sounds of Home already present at %s", output_dir)
+    if _bootstrap_audio_dir_verified(output_dir, description="Sounds of Home dataset"):
         return
 
     _download(
@@ -1144,6 +1209,11 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
     _extract_archive(archive_path, output_dir, description="Sounds of Home dataset (light)")
 
     file_count = len(_safe_iter_audio_files(output_dir))
+    _write_bootstrap_manifest(
+        output_dir,
+        description="Sounds of Home dataset",
+        expected_audio_files=file_count,
+    )
     log.info("  Extracted %d Sounds of Home audio files into %s", file_count, output_dir)
 
 
@@ -1156,8 +1226,7 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
     hf_config = str(dataset_cfg.get("hf_config", "all"))
     io_workers = _resolve_io_workers(dataset_cfg)
 
-    if _dir_has_entries(output_dir):
-        log.info("  BIGOS dataset already present at %s", output_dir)
+    if _bootstrap_audio_dir_verified(output_dir, description="BIGOS dataset"):
         return
 
     _reset_dir(output_dir)
@@ -1178,6 +1247,12 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
             trust_remote_code=True,
         )
     count = _write_dataset_audio(dataset, output_dir, "bigos", max_clips, io_workers)
+    _write_bootstrap_manifest(
+        output_dir,
+        description="BIGOS dataset",
+        expected_audio_files=count,
+        metadata={"split": split, "hf_config": hf_config},
+    )
     log.info("  Saved %d BIGOS clips to %s", count, output_dir)
 
 
@@ -1596,8 +1671,7 @@ def step_prepare_tools() -> bool:
 def _download_mit_rirs(dest: Path, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
-    if dest.exists() and any(dest.iterdir()):
-        log.info("  MIT RIRs already present")
+    if _bootstrap_audio_dir_verified(dest, description="MIT RIR dataset"):
         return
 
     dest.mkdir(parents=True, exist_ok=True)
@@ -1608,6 +1682,7 @@ def _download_mit_rirs(dest: Path, io_workers: int = 4) -> None:
         trust_remote_code=True,
     )
     count = _write_dataset_audio(dataset, dest, "rir", None, io_workers)
+    _write_bootstrap_manifest(dest, description="MIT RIR dataset", expected_audio_files=count)
     log.info("  Saved %d RIR files", count)
 
 
@@ -1616,8 +1691,7 @@ def _download_musan_openslr(dest: Path) -> None:
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / "musan.tar.gz"
 
-    if _dir_has_entries(dest):
-        log.info("  MUSAN already present at %s", dest)
+    if _bootstrap_audio_dir_verified(dest, description="MUSAN music/noise dataset"):
         return
 
     _download(
@@ -1627,9 +1701,7 @@ def _download_musan_openslr(dest: Path) -> None:
     )
 
     extract_dir = archive_dir / "musan_extract"
-    _reset_dir(extract_dir)
-    with tarfile.open(archive_path, "r:gz") as archive:
-        archive.extractall(extract_dir)
+    _extract_archive(archive_path, extract_dir, description="MUSAN corpus archive")
 
     musan_root = extract_dir / "musan"
     if not musan_root.exists():
@@ -1648,6 +1720,7 @@ def _download_musan_openslr(dest: Path) -> None:
             shutil.copy2(audio_file, target)
             copied += 1
 
+    _write_bootstrap_manifest(dest, description="MUSAN music/noise dataset", expected_audio_files=copied)
     shutil.rmtree(extract_dir, ignore_errors=True)
     log.info("  Prepared %d MUSAN music/noise files in %s", copied, dest)
 
@@ -1655,8 +1728,7 @@ def _download_musan_openslr(dest: Path) -> None:
 def _download_audioset_subset(dest: Path, limit: int = 300, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
-    if dest.exists() and any(dest.iterdir()):
-        log.info("  AudioSet subset already present")
+    if _bootstrap_audio_dir_verified(dest, description="AudioSet subset"):
         return
 
     dest.mkdir(parents=True, exist_ok=True)
@@ -1668,14 +1740,14 @@ def _download_audioset_subset(dest: Path, limit: int = 300, io_workers: int = 4)
         trust_remote_code=True,
     )
     count = _write_dataset_audio(dataset, dest, "audioset", limit, io_workers)
+    _write_bootstrap_manifest(dest, description="AudioSet subset", expected_audio_files=count, metadata={"limit": limit})
     log.info("  Saved %d AudioSet clips", count)
 
 
 def _download_fma_subset(dest: Path, limit: int = 200, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
-    if dest.exists() and any(dest.iterdir()):
-        log.info("  FMA subset already present")
+    if _bootstrap_audio_dir_verified(dest, description="FMA subset"):
         return
 
     dest.mkdir(parents=True, exist_ok=True)
@@ -1702,6 +1774,7 @@ def _download_fma_subset(dest: Path, limit: int = 200, io_workers: int = 4) -> N
         )
         count = _write_dataset_audio(dataset, dest, "fma", limit, io_workers)
 
+    _write_bootstrap_manifest(dest, description="FMA subset", expected_audio_files=count, metadata={"limit": limit})
     log.info("  Saved %d FMA clips", count)
 
 
