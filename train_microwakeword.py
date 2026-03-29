@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import tarfile
 import csv
+import faulthandler
 import hashlib
 import importlib.util
 import io
@@ -34,6 +36,7 @@ PIPER_MODELS_DIR = THIRD_PARTY_DIR / "piper-models"
 DATA_DIR = SCRIPT_DIR / "data"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 EXPORT_DIR = SCRIPT_DIR / "export"
+LOGS_DIR = OUTPUT_DIR / "_logs"
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
 TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
 MDC_PIP_SPEC = "datacollective>=0.4.5"
@@ -55,6 +58,60 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("train_microwakeword")
+_SESSION_LOG_FILE: io.TextIOWrapper | None = None
+_SESSION_CRASH_LOG_FILE: io.TextIOWrapper | None = None
+
+
+def _close_session_log_files() -> None:
+    global _SESSION_LOG_FILE, _SESSION_CRASH_LOG_FILE
+
+    for handle_name in ("_SESSION_LOG_FILE", "_SESSION_CRASH_LOG_FILE"):
+        handle = globals().get(handle_name)
+        if handle is None:
+            continue
+        try:
+            handle.flush()
+            handle.close()
+        except OSError:
+            pass
+        globals()[handle_name] = None
+
+
+atexit.register(_close_session_log_files)
+
+
+def _setup_session_logging(config_path: Path) -> Path:
+    global _SESSION_LOG_FILE, _SESSION_CRASH_LOG_FILE
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    base_name = f"{config_path.stem}-{timestamp}"
+    session_log_path = LOGS_DIR / f"{base_name}.log"
+    crash_log_path = LOGS_DIR / f"{base_name}.crash.log"
+
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == session_log_path:
+            return session_log_path
+
+    _close_session_log_files()
+
+    _SESSION_LOG_FILE = open(session_log_path, "a", encoding="utf-8", buffering=1)
+    file_handler = logging.StreamHandler(_SESSION_LOG_FILE)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s  %(levelname)-8s  %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    root_logger.addHandler(file_handler)
+    logging.captureWarnings(True)
+
+    _SESSION_CRASH_LOG_FILE = open(crash_log_path, "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(file=_SESSION_CRASH_LOG_FILE, all_threads=True)
+
+    return session_log_path
 
 
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -2700,6 +2757,11 @@ def main() -> None:
 
     global CONFIG_FILE
     CONFIG_FILE = Path(args.config).resolve()
+    session_log_path = _setup_session_logging(CONFIG_FILE)
+    log.info("Session log file: %s", session_log_path)
+    log.info("Crash log file: %s", session_log_path.with_suffix(".crash.log"))
+    log.info("Working directory: %s", Path.cwd())
+    log.info("Config file: %s", CONFIG_FILE)
 
     ok = run_pipeline(from_step=args.from_step, single_step=args.step)
     sys.exit(0 if ok else 1)
