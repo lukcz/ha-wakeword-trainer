@@ -638,6 +638,22 @@ def _bootstrap_audio_dir_verified(path: Path, *, description: str) -> bool:
             reason = f"too few audio files ({actual_audio_files}/{expected_audio_files})"
         elif actual_audio_files > expected_audio_files:
             reason = f"too many audio files ({actual_audio_files}/{expected_audio_files})"
+            log.warning(
+                "  Existing %s at %s has more audio files than the recorded bootstrap manifest expects: %s. "
+                "Reusing the larger local dataset and updating the manifest.",
+                description,
+                path,
+                reason,
+            )
+            metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else None
+            _write_bootstrap_manifest(
+                path,
+                description=description,
+                expected_audio_files=actual_audio_files,
+                metadata=metadata,
+            )
+            log.info("  Adopted existing %s at %s (%d audio files)", description, path, actual_audio_files)
+            return True
         else:
             reason = f"audio file count mismatch ({actual_audio_files}/{expected_audio_files})"
         log.warning(
