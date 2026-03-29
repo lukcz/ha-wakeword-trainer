@@ -1809,6 +1809,20 @@ def _has_any_mmap_dir(root: Path) -> bool:
     return any(root.glob("**/*_mmap"))
 
 
+def _positive_feature_pack_status(root: Path) -> tuple[bool, list[str]]:
+    missing = []
+    for split in ("training", "validation", "testing"):
+        split_dir = root / split
+        if not split_dir.exists() or not _has_any_mmap_dir(split_dir):
+            missing.append(split)
+    return (len(missing) == 0), missing
+
+
+def _positive_feature_pack_ready(root: Path) -> bool:
+    ready, _ = _positive_feature_pack_status(root)
+    return ready
+
+
 def _background_negative_pack_ready(root: Path) -> bool:
     required = (
         root / "training",
@@ -2370,10 +2384,17 @@ def step_generate_positive_features() -> bool:
 
     cfg = _load_config()
     features_dir = _positive_features_dir(cfg)
-    training_mmap = features_dir / "training" / "wakeword_mmap"
-    if training_mmap.exists():
-        log.info("  Positive features already present at %s", training_mmap)
+    ready, missing_splits = _positive_feature_pack_status(features_dir)
+    if ready:
+        log.info("  Positive features already present at %s", features_dir)
         return True
+    if features_dir.exists() and any(features_dir.iterdir()):
+        log.warning(
+            "  Existing positive feature pack at %s is incomplete; missing mmap data for: %s. Rebuilding.",
+            features_dir,
+            ", ".join(missing_splits),
+        )
+        shutil.rmtree(features_dir)
 
     from mmap_ninja.ragged import RaggedMmap
     from microwakeword.audio.augmentation import Augmentation
@@ -2671,6 +2692,16 @@ def step_train() -> bool:
         neg_root = _negative_datasets_dir(cfg)
         for name in _negative_feature_names(cfg):
             _download_negative_feature_pack(neg_root, name)
+
+        positive_root = _positive_features_dir(cfg)
+        if not _positive_feature_pack_ready(positive_root):
+            _, missing_splits = _positive_feature_pack_status(positive_root)
+            log.info(
+                "  Positive features are missing required splits (%s); rebuilding them before training.",
+                ", ".join(missing_splits),
+            )
+            if not step_generate_positive_features():
+                return False
 
         if _generated_background_negatives_enabled(cfg) and not _background_negative_pack_ready(_background_negative_features_dir(cfg)):
             log.info("  Generated background negative features are missing; building them before training.")
