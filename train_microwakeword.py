@@ -66,6 +66,17 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes}B"
 
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{secs:d}s"
+
+
 def _download(
     url: str,
     dest: Path,
@@ -99,6 +110,7 @@ def _download(
                 start_ts = time.time()
                 last_log_ts = start_ts
                 last_logged_bucket = -1
+                progress_log_interval_s = 5.0
                 with open(tmp, "wb") as handle:
                     for chunk in response.iter_content(chunk_size=1 << 20):
                         if chunk:
@@ -108,11 +120,13 @@ def _download(
                             now = time.time()
                             should_log = False
                             if total_bytes > 0:
-                                bucket = int((bytes_written / total_bytes) * 20)
+                                bucket = int((bytes_written / total_bytes) * 100)
                                 if bucket > last_logged_bucket:
                                     last_logged_bucket = bucket
                                     should_log = True
-                            elif now - last_log_ts >= 5:
+                                if now - last_log_ts >= progress_log_interval_s:
+                                    should_log = True
+                            elif now - last_log_ts >= progress_log_interval_s:
                                 should_log = True
 
                             if should_log:
@@ -120,13 +134,16 @@ def _download(
                                 rate = bytes_written / elapsed
                                 if total_bytes > 0:
                                     pct = min(100.0, (bytes_written / total_bytes) * 100.0)
+                                    remaining_bytes = max(total_bytes - bytes_written, 0)
+                                    eta_seconds = remaining_bytes / rate if rate > 0 else 0.0
                                     log.info(
-                                        "  Download progress for %s: %s / %s (%.1f%%) at %s/s",
+                                        "  Download progress for %s: %s / %s (%.1f%%) at %s/s, ETA %s",
                                         description,
                                         _format_bytes(bytes_written),
                                         _format_bytes(total_bytes),
                                         pct,
                                         _format_bytes(int(rate)),
+                                        _format_duration(eta_seconds),
                                     )
                                 else:
                                     log.info(
