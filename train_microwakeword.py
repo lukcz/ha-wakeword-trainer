@@ -788,16 +788,42 @@ def _resolve_common_voice_dataset_id(*, locale: str, version: str, dataset_cfg: 
 
     escaped_version = re.escape(version)
     escaped_locale = re.escape(locale)
-    patterns = [
-        rf'"id":"([^"]+)","name":"Common Voice Scripted Speech {escaped_version} - [^"]+","license":[^{{}}]*?"locale":"{escaped_locale}"',
-        rf'href="/datasets/([^"]+)"><span class="truncate">Common Voice Scripted Speech {escaped_version} - [^<]+</span></a>.*?<td[^>]*>{escaped_locale}</td>',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, html, flags=re.DOTALL)
-        if match:
-            dataset_id = match.group(1)
+
+    row_pattern = re.compile(
+        rf"<tr\b[^>]*>.*?</tr>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    title_pattern = re.compile(
+        rf'Common Voice Scripted Speech {escaped_version} - [^<"]+',
+        flags=re.IGNORECASE,
+    )
+    link_pattern = re.compile(r'href="/datasets/([^"]+)"', flags=re.IGNORECASE)
+    locale_cell_pattern = re.compile(
+        rf"<td\b[^>]*>\s*{escaped_locale}\s*</td>",
+        flags=re.IGNORECASE,
+    )
+
+    for row_match in row_pattern.finditer(html):
+        row_html = row_match.group(0)
+        if not title_pattern.search(row_html):
+            continue
+        if not locale_cell_pattern.search(row_html):
+            continue
+        link_match = link_pattern.search(row_html)
+        if link_match:
+            dataset_id = link_match.group(1)
             log.info("  Resolved Common Voice %s (%s) dataset id: %s", version, locale, dataset_id)
             return dataset_id
+
+    json_pattern = re.compile(
+        rf'"id":"([^"]+)","name":"Common Voice Scripted Speech {escaped_version} - [^"]+","licenseAbbreviation":"[^"]+","locale":"{escaped_locale}"',
+        flags=re.IGNORECASE,
+    )
+    json_match = json_pattern.search(html)
+    if json_match:
+        dataset_id = json_match.group(1)
+        log.info("  Resolved Common Voice %s (%s) dataset id: %s", version, locale, dataset_id)
+        return dataset_id
 
     raise RuntimeError(f"Could not resolve Common Voice dataset id for locale '{locale}' and version '{version}' from Mozilla Data Collective.")
 
