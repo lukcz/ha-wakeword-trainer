@@ -518,12 +518,19 @@ def _bootstrap_audio_dir_verified(path: Path, *, description: str) -> bool:
 
     actual_audio_files = _audio_file_count(path)
     if actual_audio_files != expected_audio_files or actual_audio_files == 0:
+        if actual_audio_files == 0:
+            reason = "no audio files found"
+        elif actual_audio_files < expected_audio_files:
+            reason = f"too few audio files ({actual_audio_files}/{expected_audio_files})"
+        elif actual_audio_files > expected_audio_files:
+            reason = f"too many audio files ({actual_audio_files}/{expected_audio_files})"
+        else:
+            reason = f"audio file count mismatch ({actual_audio_files}/{expected_audio_files})"
         log.warning(
-            "  Existing %s at %s is incomplete (%d/%d audio files). Rebuilding.",
+            "  Existing %s at %s does not match the expected bootstrap output: %s. Rebuilding.",
             description,
             path,
-            actual_audio_files,
-            expected_audio_files,
+            reason,
         )
         return False
 
