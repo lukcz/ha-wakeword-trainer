@@ -1030,6 +1030,7 @@ def _download_fleurs_dataset(dataset_cfg: dict) -> None:
         "streaming": dataset_cfg.get("streaming", True),
         "fallback_to_non_streaming": dataset_cfg.get("fallback_to_non_streaming", True),
         "audio_column": dataset_cfg.get("audio_column", "audio"),
+        "trust_remote_code": dataset_cfg.get("trust_remote_code", True),
     }
     if "io_workers" in dataset_cfg:
         merged["io_workers"] = dataset_cfg["io_workers"]
