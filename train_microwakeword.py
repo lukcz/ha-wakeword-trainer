@@ -24,6 +24,7 @@ import time
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+from posixpath import normpath as posix_normpath
 from typing import Callable
 
 import requests
@@ -265,6 +266,62 @@ def _extract_members_with_progress(
         elapsed,
         _format_bytes(int(rate)),
     )
+
+
+def _safe_extract_relative_path(member_name: str) -> Path:
+    normalized = posix_normpath(str(member_name).replace("\\", "/")).lstrip("/")
+    relative = Path(normalized)
+    if normalized in {"", "."}:
+        return Path()
+    if any(part == ".." for part in relative.parts):
+        raise ValueError(f"Archive member escapes target directory: {member_name}")
+    return relative
+
+
+def _extract_zip_member_streaming(
+    archive: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    extract_dir: Path,
+    *,
+    allow_resume: bool = False,
+    chunk_size: int = 1 << 20,
+) -> None:
+    relative = _safe_extract_relative_path(member.filename)
+    if not relative.parts:
+        return
+
+    target = extract_dir / relative
+    if member.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if allow_resume and target.exists() and target.stat().st_size == max(0, int(getattr(member, "file_size", 0))):
+        return
+
+    with archive.open(member) as src, open(target, "wb") as dst:
+        shutil.copyfileobj(src, dst, length=chunk_size)
+
+
+def _extract_zip_archive(
+    archive_path: Path,
+    extract_dir: Path,
+    *,
+    label: str,
+    allow_resume: bool = False,
+) -> None:
+    with zipfile.ZipFile(archive_path) as archive:
+        _extract_members_with_progress(
+            description=label,
+            members=archive.infolist(),
+            extract_one=lambda member: _extract_zip_member_streaming(
+                archive,
+                member,
+                extract_dir,
+                allow_resume=allow_resume,
+            ),
+            size_getter=lambda member: getattr(member, "file_size", 0),
+        )
 
 
 def _download(
@@ -1072,13 +1129,12 @@ def _extract_archive(archive_path: Path, extract_dir: Path, description: str | N
     archive_str = str(archive_path)
     if zipfile.is_zipfile(archive_path):
         try:
-            with zipfile.ZipFile(archive_path) as archive:
-                _extract_members_with_progress(
-                    description=label,
-                    members=archive.infolist(),
-                    extract_one=lambda member: archive.extract(member, path=extract_dir),
-                    size_getter=lambda member: getattr(member, "file_size", 0),
-                )
+            _extract_zip_archive(
+                archive_path,
+                extract_dir,
+                label=label,
+                allow_resume=not reset_dir,
+            )
         except (NotImplementedError, RuntimeError, zipfile.BadZipFile) as exc:
             log.warning("  Python zip extraction failed for %s: %s", archive_path.name, exc)
             if _ensure_python_module("zipfile_inflate64", ZIPFILE_INFLATE64_PIP_SPEC):
@@ -1087,13 +1143,12 @@ def _extract_archive(archive_path: Path, extract_dir: Path, description: str | N
                 if reset_dir:
                     _reset_dir(extract_dir)
                 try:
-                    with zipfile.ZipFile(archive_path) as archive:
-                        _extract_members_with_progress(
-                            description=label,
-                            members=archive.infolist(),
-                            extract_one=lambda member: archive.extract(member, path=extract_dir),
-                            size_getter=lambda member: getattr(member, "file_size", 0),
-                        )
+                    _extract_zip_archive(
+                        archive_path,
+                        extract_dir,
+                        label=label,
+                        allow_resume=not reset_dir,
+                    )
                     return
                 except (NotImplementedError, RuntimeError, zipfile.BadZipFile) as inflate_exc:
                     log.warning("  zipfile-inflate64 extraction failed for %s: %s", archive_path.name, inflate_exc)
@@ -1270,7 +1325,12 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
         "Sounds of Home dataset (light)",
     )
 
-    _extract_archive(archive_path, output_dir, description="Sounds of Home dataset (light)")
+    _extract_archive(
+        archive_path,
+        output_dir,
+        description="Sounds of Home dataset (light)",
+        reset_dir=False,
+    )
 
     file_count = len(_safe_iter_audio_files(output_dir))
     _write_bootstrap_manifest(
