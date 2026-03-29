@@ -56,6 +56,16 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = N
     subprocess.check_call(cmd, cwd=str(cwd) if cwd else None, env=env)
 
 
+def _format_bytes(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{num_bytes}B"
+
+
 def _download(
     url: str,
     dest: Path,
@@ -81,10 +91,60 @@ def _download(
         try:
             with requests.get(url, stream=True, timeout=120) as response:
                 response.raise_for_status()
+                total_bytes = int(response.headers.get("content-length", "0") or "0")
+                if total_bytes > 0:
+                    log.info("  Expected download size for %s: %s", description, _format_bytes(total_bytes))
+
+                bytes_written = 0
+                start_ts = time.time()
+                last_log_ts = start_ts
+                last_logged_bucket = -1
                 with open(tmp, "wb") as handle:
                     for chunk in response.iter_content(chunk_size=1 << 20):
                         if chunk:
                             handle.write(chunk)
+                            bytes_written += len(chunk)
+
+                            now = time.time()
+                            should_log = False
+                            if total_bytes > 0:
+                                bucket = int((bytes_written / total_bytes) * 20)
+                                if bucket > last_logged_bucket:
+                                    last_logged_bucket = bucket
+                                    should_log = True
+                            elif now - last_log_ts >= 5:
+                                should_log = True
+
+                            if should_log:
+                                elapsed = max(now - start_ts, 0.001)
+                                rate = bytes_written / elapsed
+                                if total_bytes > 0:
+                                    pct = min(100.0, (bytes_written / total_bytes) * 100.0)
+                                    log.info(
+                                        "  Download progress for %s: %s / %s (%.1f%%) at %s/s",
+                                        description,
+                                        _format_bytes(bytes_written),
+                                        _format_bytes(total_bytes),
+                                        pct,
+                                        _format_bytes(int(rate)),
+                                    )
+                                else:
+                                    log.info(
+                                        "  Download progress for %s: %s at %s/s",
+                                        description,
+                                        _format_bytes(bytes_written),
+                                        _format_bytes(int(rate)),
+                                    )
+                                last_log_ts = now
+
+                elapsed = max(time.time() - start_ts, 0.001)
+                log.info(
+                    "  Finished downloading %s: %s in %.1fs (%s/s)",
+                    description,
+                    _format_bytes(bytes_written),
+                    elapsed,
+                    _format_bytes(int(bytes_written / elapsed)),
+                )
             tmp.replace(dest)
             return
         except requests.HTTPError as exc:
