@@ -37,6 +37,7 @@ EXPORT_DIR = SCRIPT_DIR / "export"
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
 TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
 MDC_PIP_SPEC = "datacollective>=0.4.5"
+ZIPFILE_INFLATE64_PIP_SPEC = "zipfile-inflate64>=0.1"
 COMMON_VOICE_MDC_ORG_URL = "https://datacollective.mozillafoundation.org/organization/cmfh0j9o10006ns07jq45h7xk"
 
 CONFIG_FILE = DEFAULT_CONFIG
@@ -859,6 +860,17 @@ def _extract_archive(archive_path: Path, extract_dir: Path) -> None:
                 archive.extractall(extract_dir)
         except (NotImplementedError, RuntimeError, zipfile.BadZipFile) as exc:
             log.warning("  Python zip extraction failed for %s: %s", archive_path.name, exc)
+            if _ensure_python_module("zipfile_inflate64", ZIPFILE_INFLATE64_PIP_SPEC):
+                import zipfile_inflate64  # noqa: F401
+
+                _reset_dir(extract_dir)
+                try:
+                    with zipfile.ZipFile(archive_path) as archive:
+                        archive.extractall(extract_dir)
+                    return
+                except (NotImplementedError, RuntimeError, zipfile.BadZipFile) as inflate_exc:
+                    log.warning("  zipfile-inflate64 extraction failed for %s: %s", archive_path.name, inflate_exc)
+                    _reset_dir(extract_dir)
             if not _extract_zip_with_external_tools(archive_path, extract_dir):
                 raise
         return
