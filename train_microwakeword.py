@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import tarfile
+import csv
 import hashlib
 import importlib.util
 import io
@@ -12,6 +13,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +36,8 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 EXPORT_DIR = SCRIPT_DIR / "export"
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
 TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
+MDC_PIP_SPEC = "datacollective>=0.4.5"
+COMMON_VOICE_MDC_ORG_URL = "https://datacollective.mozillafoundation.org/organization/cmfh0j9o10006ns07jq45h7xk"
 
 CONFIG_FILE = DEFAULT_CONFIG
 
@@ -730,20 +734,139 @@ def _download_fleurs_dataset(dataset_cfg: dict) -> None:
 
 
 def _download_common_voice_dataset(dataset_cfg: dict) -> None:
-    merged = {
-        "hf_repo": "mozilla-foundation/common_voice_16_0",
-        "hf_config": dataset_cfg.get("hf_config", "pl"),
-        "output_dir": dataset_cfg.get("output_dir", "data/common_voice_pl"),
-        "split": dataset_cfg.get("split", "train+validation"),
-        "max_clips": dataset_cfg.get("max_clips", 1200),
-        "prefix": dataset_cfg.get("prefix", "common_voice"),
-        "streaming": dataset_cfg.get("streaming", True),
-        "fallback_to_non_streaming": dataset_cfg.get("fallback_to_non_streaming", True),
-        "audio_column": dataset_cfg.get("audio_column", "audio"),
-    }
-    if "io_workers" in dataset_cfg:
-        merged["io_workers"] = dataset_cfg["io_workers"]
-    _download_hf_audio_dataset(merged)
+    if not _ensure_python_module("datacollective", MDC_PIP_SPEC):
+        raise RuntimeError("Mozilla Data Collective Python SDK is required for Common Voice downloads.")
+
+    from datacollective import download_dataset
+
+    output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/common_voice_pl")))
+    max_clips = int(dataset_cfg.get("max_clips", 1200))
+    prefix = str(dataset_cfg.get("prefix", "common_voice"))
+    locale = str(dataset_cfg.get("locale", dataset_cfg.get("hf_config", "pl"))).strip().lower()
+    version = str(dataset_cfg.get("version", "25.0")).strip()
+    archive_dir = DATA_DIR / "_archives" / "common_voice"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    if _dir_has_entries(output_dir):
+        log.info("  Common Voice already present at %s", output_dir)
+        return
+
+    if not os.environ.get("MDC_API_KEY"):
+        raise RuntimeError(
+            "Common Voice now downloads from Mozilla Data Collective. Set MDC_API_KEY and accept dataset terms in the browser first."
+        )
+
+    dataset_id = _resolve_common_voice_dataset_id(locale=locale, version=version, dataset_cfg=dataset_cfg)
+    log.info("  Downloading Common Voice %s (%s) from Mozilla Data Collective", version, locale)
+    show_progress = bool(dataset_cfg.get("show_progress", True))
+    archive_path = download_dataset(
+        dataset_id,
+        download_directory=str(archive_dir),
+        show_progress=show_progress,
+        overwrite_existing=False,
+        enable_logging=False,
+    )
+
+    extract_dir = archive_dir / f"extract_{locale}_{version.replace('.', '_')}"
+    _extract_archive(Path(archive_path), extract_dir)
+    dataset_root = _find_common_voice_dataset_root(extract_dir)
+    _reset_dir(output_dir)
+    count = _copy_common_voice_audio_subset(dataset_root, output_dir, prefix=prefix, max_clips=max_clips)
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    log.info("  Saved %d Common Voice clips to %s", count, output_dir)
+
+
+def _resolve_common_voice_dataset_id(*, locale: str, version: str, dataset_cfg: dict) -> str:
+    configured_id = str(dataset_cfg.get("dataset_id", "")).strip()
+    if configured_id:
+        return configured_id
+
+    catalog_url = str(dataset_cfg.get("catalog_url", COMMON_VOICE_MDC_ORG_URL))
+    response = requests.get(catalog_url, timeout=120)
+    response.raise_for_status()
+    html = response.text
+
+    escaped_version = re.escape(version)
+    escaped_locale = re.escape(locale)
+    patterns = [
+        rf'"id":"([^"]+)","name":"Common Voice Scripted Speech {escaped_version} - [^"]+","license":[^{{}}]*?"locale":"{escaped_locale}"',
+        rf'href="/datasets/([^"]+)"><span class="truncate">Common Voice Scripted Speech {escaped_version} - [^<]+</span></a>.*?<td[^>]*>{escaped_locale}</td>',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.DOTALL)
+        if match:
+            dataset_id = match.group(1)
+            log.info("  Resolved Common Voice %s (%s) dataset id: %s", version, locale, dataset_id)
+            return dataset_id
+
+    raise RuntimeError(f"Could not resolve Common Voice dataset id for locale '{locale}' and version '{version}' from Mozilla Data Collective.")
+
+
+def _extract_archive(archive_path: Path, extract_dir: Path) -> None:
+    _reset_dir(extract_dir)
+    archive_str = str(archive_path)
+    if zipfile.is_zipfile(archive_path):
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(extract_dir)
+        return
+    if tarfile.is_tarfile(archive_path):
+        with tarfile.open(archive_path, "r:*") as archive:
+            archive.extractall(extract_dir)
+        return
+    shutil.unpack_archive(archive_str, str(extract_dir))
+
+
+def _find_common_voice_dataset_root(extract_dir: Path) -> Path:
+    if (extract_dir / "clips").exists():
+        return extract_dir
+
+    candidates: list[Path] = []
+    for clips_dir in extract_dir.rglob("clips"):
+        if clips_dir.is_dir():
+            candidates.append(clips_dir.parent)
+
+    if not candidates:
+        raise FileNotFoundError(f"Could not find Common Voice clips directory inside {extract_dir}")
+
+    candidates.sort(key=lambda path: len(path.parts))
+    return candidates[0]
+
+
+def _iter_common_voice_relative_paths(dataset_root: Path) -> list[str]:
+    validated_tsv = dataset_root / "validated.tsv"
+    if validated_tsv.exists():
+        with open(validated_tsv, encoding="utf-8") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if reader.fieldnames and "path" in reader.fieldnames:
+                return [str(row["path"]).strip() for row in reader if str(row.get("path", "")).strip()]
+
+    clips_root = dataset_root / "clips"
+    return [path.name for path in sorted(_safe_iter_audio_files(clips_root))]
+
+
+def _copy_common_voice_audio_subset(dataset_root: Path, output_dir: Path, *, prefix: str, max_clips: int) -> int:
+    clips_root = dataset_root / "clips"
+    if not clips_root.exists():
+        raise FileNotFoundError(f"Expected Common Voice clips directory not found: {clips_root}")
+
+    count = 0
+    seen_paths: set[Path] = set()
+    for relative_path in _iter_common_voice_relative_paths(dataset_root):
+        if count >= max_clips:
+            break
+        source = clips_root / relative_path
+        if not source.exists() or source in seen_paths:
+            continue
+        suffix = source.suffix.lower() or ".mp3"
+        dest = output_dir / f"{prefix}_{count:06d}{suffix}"
+        shutil.copy2(source, dest)
+        seen_paths.add(source)
+        count += 1
+
+    if count == 0:
+        raise RuntimeError(f"No Common Voice audio clips were copied from {dataset_root}")
+
+    return count
 
 
 def _download_voxpopuli_dataset(dataset_cfg: dict) -> None:
@@ -794,7 +917,7 @@ def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
         return
 
     _download(
-        str(dataset_cfg.get("url", "https://openslr.org/resources/94/mls_polish.tar.gz")),
+        str(dataset_cfg.get("url", "https://dl.fbaipublicfiles.com/mls/mls_polish.tar.gz")),
         archive_path,
         "MLS Polish corpus (OpenSLR)",
     )

@@ -133,7 +133,7 @@ The training launcher also auto-installs `tensorboard` if an older `.venv` is mi
 By default the bootstrap tries:
 
 - `amu-cai/pl-asr-bigos-v2` if you have access
-- `mozilla-foundation/common_voice_16_0` for `pl`
+- `Common Voice` for `pl` from Mozilla Data Collective
 - `google/fleurs` for `pl_pl`
 - `facebook/voxpopuli` for `pl`
 - `MLS Polish` from OpenSLR
@@ -143,6 +143,15 @@ By default the bootstrap tries:
 - `MUSAN` from OpenSLR filtered to `music` and `noise`
 - `Sounds of Home` as an optional residential speech-removed background source
 - any local datasets you place in `data/mc_speech` or `data/pl_speech`
+
+Common Voice is no longer downloaded from Hugging Face. The launcher now uses
+Mozilla Data Collective directly and expects:
+
+- `MDC_API_KEY` to be set in the environment
+- the Common Voice dataset terms to be accepted in the browser first
+
+The dataset id is resolved automatically from the official Common Voice catalog,
+so you usually only need the API key.
 
 `AxonData/speech-free-background-noise` is no longer enabled by default in the
 Polish VAD presets because some recordings may still contain intelligible speech
