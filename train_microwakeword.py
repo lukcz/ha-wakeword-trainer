@@ -548,7 +548,17 @@ def _background_negative_features_dir(cfg: dict) -> Path:
 
 
 def _negative_datasets_dir(cfg: dict) -> Path:
+    raw = cfg.get("negative_feature_cache_dir", "data/negative_feature_packs")
+    return _resolve_path(str(raw))
+
+
+def _legacy_negative_datasets_dir(cfg: dict) -> Path:
     return _project_dir(cfg) / "negative_datasets"
+
+
+def _negative_feature_archives_dir(cfg: dict) -> Path:
+    raw = cfg.get("negative_feature_archive_dir", "data/_archives/negative_feature_packs")
+    return _resolve_path(str(raw))
 
 
 def _staged_positive_dir(cfg: dict) -> Path:
@@ -1969,7 +1979,13 @@ def _download_fma_subset(dest: Path, limit: int = 200, io_workers: int = 4) -> N
     log.info("  Saved %d FMA clips", count)
 
 
-def _download_negative_feature_pack(dest_root: Path, name: str) -> None:
+def _download_negative_feature_pack(
+    dest_root: Path,
+    name: str,
+    *,
+    archive_root: Path | None = None,
+    legacy_root: Path | None = None,
+) -> None:
     from mmap_ninja.ragged import RaggedMmap
 
     def validate_pack(pack_dir: Path) -> tuple[bool, str | None]:
@@ -1985,8 +2001,38 @@ def _download_negative_feature_pack(dest_root: Path, name: str) -> None:
 
         return True, None
 
+    def adopt_legacy_pack(legacy_target_dir: Path, shared_target_dir: Path) -> bool:
+        if not legacy_target_dir.exists() or not any(legacy_target_dir.iterdir()):
+            return False
+
+        valid, reason = validate_pack(legacy_target_dir)
+        if not valid:
+            log.warning(
+                "  Legacy negative feature pack %s at %s is invalid (%s); ignoring legacy copy.",
+                name,
+                legacy_target_dir,
+                reason,
+            )
+            return False
+
+        shared_target_dir.parent.mkdir(parents=True, exist_ok=True)
+        if shared_target_dir.exists():
+            shutil.rmtree(shared_target_dir, ignore_errors=True)
+
+        shutil.move(str(legacy_target_dir), str(shared_target_dir))
+        log.info(
+            "  Adopted legacy negative feature pack %s into shared cache at %s",
+            name,
+            shared_target_dir,
+        )
+        return True
+
     target_dir = dest_root / name
-    zip_path = dest_root / f"{name}.zip"
+    archive_root = archive_root or dest_root
+    archive_root.mkdir(parents=True, exist_ok=True)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    zip_path = archive_root / f"{name}.zip"
+
     if target_dir.exists() and any(target_dir.iterdir()):
         valid, reason = validate_pack(target_dir)
         if valid:
@@ -1997,6 +2043,10 @@ def _download_negative_feature_pack(dest_root: Path, name: str) -> None:
         shutil.rmtree(target_dir, ignore_errors=True)
         if zip_path.exists():
             zip_path.unlink()
+
+    legacy_target_dir = legacy_root / name if legacy_root is not None else None
+    if legacy_target_dir is not None and adopt_legacy_pack(legacy_target_dir, target_dir):
+        return
 
     _download(
         f"{NEGATIVE_FEATURE_ROOT}/{name}.zip",
@@ -2075,8 +2125,15 @@ def step_download_assets() -> bool:
         _bootstrap_background_audio_datasets(cfg)
 
         neg_root = _negative_datasets_dir(cfg)
+        neg_archive_root = _negative_feature_archives_dir(cfg)
+        legacy_neg_root = _legacy_negative_datasets_dir(cfg)
         for name in _negative_feature_names(cfg):
-            _download_negative_feature_pack(neg_root, name)
+            _download_negative_feature_pack(
+                neg_root,
+                name,
+                archive_root=neg_archive_root,
+                legacy_root=legacy_neg_root,
+            )
         return True
     except Exception as exc:
         log.error("  Asset download failed: %s", exc)
@@ -2693,8 +2750,15 @@ def step_train() -> bool:
     cfg = _load_config()
     try:
         neg_root = _negative_datasets_dir(cfg)
+        neg_archive_root = _negative_feature_archives_dir(cfg)
+        legacy_neg_root = _legacy_negative_datasets_dir(cfg)
         for name in _negative_feature_names(cfg):
-            _download_negative_feature_pack(neg_root, name)
+            _download_negative_feature_pack(
+                neg_root,
+                name,
+                archive_root=neg_archive_root,
+                legacy_root=legacy_neg_root,
+            )
 
         positive_root = _positive_features_dir(cfg)
         if not _positive_feature_pack_ready(positive_root):
