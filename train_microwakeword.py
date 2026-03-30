@@ -987,8 +987,39 @@ def _dir_has_entries(path: Path) -> bool:
         return False
 
 
-def _audio_file_count(path: Path) -> int:
-    return len(_safe_iter_audio_files(path))
+def _normalize_manifest_relpath(path_str: str) -> str:
+    return PurePosixPath(str(path_str).replace("\\", "/")).as_posix()
+
+
+def _default_ignored_audio_relpaths(description: str) -> set[str]:
+    if description == "Sounds of Home dataset":
+        return {
+            "VITALISE data light/Audios_modified/13/20231119_130000_modified.WAV",
+        }
+    return set()
+
+
+def _ignored_audio_relpaths(
+    *,
+    description: str,
+    metadata: dict | None = None,
+) -> set[str]:
+    ignored = set(_default_ignored_audio_relpaths(description))
+    if isinstance(metadata, dict):
+        for relpath in metadata.get("ignored_audio_relpaths", []) or []:
+            ignored.add(_normalize_manifest_relpath(str(relpath)))
+    return ignored
+
+
+def _audio_file_count(path: Path, *, ignored_relpaths: set[str] | None = None) -> int:
+    ignored_relpaths = ignored_relpaths or set()
+    count = 0
+    for audio_file in _safe_iter_audio_files(path):
+        relpath = _normalize_manifest_relpath(audio_file.relative_to(path))
+        if relpath in ignored_relpaths:
+            continue
+        count += 1
+    return count
 
 
 def _bootstrap_manifest_path(path: Path) -> Path:
@@ -1009,8 +1040,14 @@ def _write_bootstrap_manifest(path: Path, *, description: str, expected_audio_fi
     _bootstrap_manifest_path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
-def _finalize_bootstrap_audio_count(path: Path, *, description: str, expected_audio_files: int) -> int:
-    actual_audio_files = _audio_file_count(path)
+def _finalize_bootstrap_audio_count(
+    path: Path,
+    *,
+    description: str,
+    expected_audio_files: int,
+    ignored_audio_relpaths: set[str] | None = None,
+) -> int:
+    actual_audio_files = _audio_file_count(path, ignored_relpaths=ignored_audio_relpaths)
     if actual_audio_files != int(expected_audio_files):
         log.warning(
             "  %s produced %d files on disk, while the bootstrap pass counted %d items. Using the on-disk count for the manifest.",
@@ -1196,7 +1233,32 @@ def _bootstrap_audio_dir_verified(path: Path, *, description: str) -> bool:
         log.warning("  Bootstrap manifest for %s is invalid. Rebuilding.", path)
         return False
 
-    actual_audio_files = _audio_file_count(path)
+    metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else None
+    ignored_audio_relpaths = _ignored_audio_relpaths(description=description, metadata=metadata)
+    actual_audio_files = _audio_file_count(path, ignored_relpaths=ignored_audio_relpaths)
+
+    if (
+        actual_audio_files > 0
+        and ignored_audio_relpaths
+        and (metadata is None or "ignored_audio_relpaths" not in metadata)
+        and actual_audio_files + len(ignored_audio_relpaths) == expected_audio_files
+    ):
+        migrated_metadata = dict(metadata or {})
+        migrated_metadata["ignored_audio_relpaths"] = sorted(ignored_audio_relpaths)
+        _write_bootstrap_manifest(
+            path,
+            description=description,
+            expected_audio_files=actual_audio_files,
+            metadata=migrated_metadata,
+        )
+        log.info(
+            "  Adopted existing %s at %s while ignoring %d known bad audio file(s).",
+            description,
+            path,
+            len(ignored_audio_relpaths),
+        )
+        return True
+
     if actual_audio_files != expected_audio_files or actual_audio_files == 0:
         if actual_audio_files == 0:
             reason = "no audio files found"
@@ -2000,6 +2062,7 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
     archive_dir = DATA_DIR / "_archives"
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / "sounds_of_home_light.zip"
+    ignored_audio_relpaths = _ignored_audio_relpaths(description="Sounds of Home dataset")
 
     if _bootstrap_audio_dir_verified(output_dir, description="Sounds of Home dataset"):
         return
@@ -2018,11 +2081,17 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
     )
 
     file_count = len(_safe_iter_audio_files(output_dir))
-    file_count = _finalize_bootstrap_audio_count(output_dir, description="Sounds of Home dataset", expected_audio_files=file_count)
+    file_count = _finalize_bootstrap_audio_count(
+        output_dir,
+        description="Sounds of Home dataset",
+        expected_audio_files=file_count,
+        ignored_audio_relpaths=ignored_audio_relpaths,
+    )
     _write_bootstrap_manifest(
         output_dir,
         description="Sounds of Home dataset",
         expected_audio_files=file_count,
+        metadata={"ignored_audio_relpaths": sorted(ignored_audio_relpaths)},
     )
     log.info("  Extracted %d Sounds of Home audio files into %s", file_count, output_dir)
 
