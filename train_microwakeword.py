@@ -21,6 +21,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import warnings
 import zipfile
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -30,6 +31,25 @@ from typing import Callable
 
 import requests
 import yaml
+
+# Keep TensorFlow/absl import noise out of the normal training logs unless the
+# user explicitly overrides these environment variables.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+
+# audiomentations/librosa still trigger this deprecation warning through
+# pkg_resources on some environments; it is not actionable for preset tuning.
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API\..*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*pkg_resources package is slated for removal.*",
+    category=UserWarning,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 THIRD_PARTY_DIR = SCRIPT_DIR / "third_party"
@@ -3149,7 +3169,7 @@ def step_generate_positive_features() -> bool:
                 ", ".join(missing_splits),
             )
         else:
-            log.warning("  Existing positive feature pack at %s is stale for the current data/augmentation state. Rebuilding.", features_dir)
+            log.info("  Existing positive feature pack at %s is stale for the current data/augmentation state. Rebuilding.", features_dir)
         shutil.rmtree(features_dir)
 
     from mmap_ninja.ragged import RaggedMmap
