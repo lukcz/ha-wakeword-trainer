@@ -347,6 +347,54 @@ def _load_latest_result_record(config_path: Path | None = None) -> dict | None:
         return None
 
 
+def _load_result_history_records(config_path: Path | None = None) -> list[dict]:
+    _, history_path = _results_file_paths(config_path or CONFIG_FILE)
+    if not history_path.exists():
+        return []
+
+    records: list[dict] = []
+    try:
+        with open(history_path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        return []
+
+    return records
+
+
+def _load_latest_successful_result_record(
+    config_path: Path | None = None,
+    *,
+    training_dir: Path | None = None,
+) -> dict | None:
+    training_dir_str = str(training_dir) if training_dir is not None else None
+    for record in reversed(_load_result_history_records(config_path)):
+        if record.get("status") != "success" or not record.get("best_validation"):
+            continue
+        if training_dir_str is not None and record.get("training_dir") != training_dir_str:
+            continue
+        return record
+
+    latest = _load_latest_result_record(config_path)
+    if (
+        latest
+        and latest.get("status") == "success"
+        and latest.get("best_validation")
+        and (training_dir_str is None or latest.get("training_dir") == training_dir_str)
+    ):
+        return latest
+    return None
+
+
 def _recommended_probability_cutoff(record: dict | None) -> float | None:
     if not record:
         return None
@@ -2298,11 +2346,13 @@ def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
         manifest_path=_project_dir(cfg) / "staged_positive_sources.json",
         source_dirs=source_dirs,
         label="positive",
+        file_filter=_is_positive_audio_usable,
     )
 
 
 def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
     selection_mode = _background_source_sampling_mode(cfg)
+    selection_seed = _background_source_sampling_seed(cfg)
     selection_weights = _background_source_weights(cfg)
     selected_files_by_source, skipped = _select_background_source_files(cfg, source_dirs)
 
@@ -2312,6 +2362,7 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
         source_manifest = {
             "sources": _source_dirs_state(source_dirs),
             "background_source_sampling": selection_mode,
+            "background_source_sampling_seed": selection_seed,
             "background_source_weights": selection_weights,
             "selected_counts": {
                 str(source_dir): len(selected_files_by_source.get(source_dir, []))
@@ -2356,6 +2407,7 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
     source_manifest = {
         "sources": _source_dirs_state(source_dirs),
         "background_source_sampling": selection_mode,
+        "background_source_sampling_seed": selection_seed,
         "background_source_weights": selection_weights,
         "selected_counts": {
             str(source_dir): len(selected_files_by_source.get(source_dir, []))
@@ -2489,6 +2541,10 @@ def _background_source_sampling_mode(cfg: dict) -> str:
     return mode if mode in {"all", "balanced", "weighted"} else "all"
 
 
+def _background_source_sampling_seed(cfg: dict) -> int:
+    return int(cfg.get("background_source_sampling_seed", cfg.get("random_split_seed", 10)))
+
+
 def _background_source_weights(cfg: dict) -> dict[str, float]:
     raw = cfg.get("background_source_weights", {}) or {}
     weights: dict[str, float] = {}
@@ -2512,6 +2568,7 @@ def _select_background_source_files(
     source_dirs: list[Path],
 ) -> tuple[dict[Path, list[Path]], int]:
     mode = _background_source_sampling_mode(cfg)
+    selection_seed = _background_source_sampling_seed(cfg)
     selected: dict[Path, list[Path]] = {}
     skipped = 0
 
@@ -2546,7 +2603,12 @@ def _select_background_source_files(
             selected[source_dir] = []
             continue
         target_count = max(1, int(round(base_unit * weight)))
-        selected[source_dir] = usable_files[: min(len(usable_files), target_count)]
+        shuffled_files = list(usable_files)
+        random.Random(f"{selection_seed}:{source_dir}").shuffle(shuffled_files)
+        selected[source_dir] = sorted(
+            shuffled_files[: min(len(shuffled_files), target_count)],
+            key=lambda path: str(path),
+        )
 
     return selected, skipped
 
@@ -2654,9 +2716,13 @@ def _infer_positive_group_key(source_dir: Path, audio_file: Path) -> str:
 
 def _collect_positive_records(source_dirs: list[Path]) -> list[dict]:
     records: list[dict] = []
+    unreadable_files: list[str] = []
     for source_dir in source_dirs:
         bootstrap_index = _load_bootstrap_index(source_dir)
         for audio_file in sorted(_safe_iter_audio_files(source_dir), key=lambda path: str(path)):
+            if not _is_positive_audio_usable(audio_file):
+                unreadable_files.append(str(audio_file))
+                continue
             entry = bootstrap_index.get(audio_file.name, {})
             source_key = _sanitize_group_token(entry.get("source_key", source_dir.name))
             group_key = entry.get("group_key") or _infer_positive_group_key(source_dir, audio_file)
@@ -2667,6 +2733,16 @@ def _collect_positive_records(source_dirs: list[Path]) -> list[dict]:
                     "group_key": f"{source_key}:{_sanitize_group_token(group_key)}",
                 }
             )
+
+    if unreadable_files:
+        preview = ", ".join(unreadable_files[:3])
+        if len(unreadable_files) > 3:
+            preview += ", ..."
+        log.warning(
+            "  Skipped %d unreadable positive audio files during split preparation: %s",
+            len(unreadable_files),
+            preview,
+        )
     return records
 
 
@@ -2680,26 +2756,40 @@ def _split_positive_records(records: list[dict], split_count: float, seed: int) 
         source_groups = list(grouped[source_key].items())
         rng = random.Random(f"{seed}:{source_key}")
         rng.shuffle(source_groups)
+        source_groups.sort(key=lambda item: len(item[1]), reverse=True)
 
         source_total = sum(len(items) for _, items in source_groups)
         validation_target = min(source_total, int(round(source_total * split_count)))
         test_target = min(max(0, source_total - validation_target), int(round(source_total * split_count)))
-        assigned_counts = {"validation": 0, "test": 0}
+        train_target = max(1, source_total - validation_target - test_target)
+        assigned_counts = {"train": 0, "validation": 0, "test": 0}
         source_split_groups: dict[str, list[tuple[str, list[dict]]]] = {
             "train": [],
             "validation": [],
             "test": [],
         }
+        targets = {
+            "train": train_target,
+            "validation": validation_target,
+            "test": test_target,
+        }
+        split_priority = {"validation": 0, "test": 1, "train": 2}
 
         for group_key, group_records in source_groups:
-            target_split = "train"
-            if assigned_counts["validation"] < validation_target:
-                target_split = "validation"
-                assigned_counts["validation"] += len(group_records)
-            elif assigned_counts["test"] < test_target:
-                target_split = "test"
-                assigned_counts["test"] += len(group_records)
+            group_size = len(group_records)
+
+            def split_score(split_name: str) -> tuple[float, float, int]:
+                target = targets[split_name]
+                if target <= 0:
+                    return (float("inf"), float("inf"), split_priority[split_name])
+                projected = assigned_counts[split_name] + group_size
+                relative_error = abs(projected - target) / max(target, 1)
+                overshoot = max(0, projected - target) / max(target, 1)
+                return (relative_error, overshoot, split_priority[split_name])
+
+            target_split = min(("validation", "test", "train"), key=split_score)
             source_split_groups[target_split].append((group_key, group_records))
+            assigned_counts[target_split] += group_size
 
         if not source_split_groups["train"]:
             donor_split = "test" if source_split_groups["test"] else "validation"
@@ -2708,7 +2798,10 @@ def _split_positive_records(records: list[dict], split_count: float, seed: int) 
                     range(len(source_split_groups[donor_split])),
                     key=lambda idx: len(source_split_groups[donor_split][idx][1]),
                 )
+                _, donor_records = source_split_groups[donor_split][donor_index]
+                assigned_counts[donor_split] -= len(donor_records)
                 source_split_groups["train"].append(source_split_groups[donor_split].pop(donor_index))
+                assigned_counts["train"] += len(donor_records)
 
         for split_name, grouped_records in source_split_groups.items():
             for _, group_records in grouped_records:
@@ -2853,8 +2946,9 @@ def _positive_feature_pack_status(root: Path) -> tuple[bool, list[str]]:
     missing = []
     for split in ("training", "validation", "testing"):
         split_dir = root / split
-        if not split_dir.exists() or not _has_any_mmap_dir(split_dir):
-            missing.append(split)
+        valid, reason = _validate_mmap_split_dir(split_dir)
+        if not valid:
+            missing.append(f"{split} ({reason})" if reason else split)
     return (len(missing) == 0), missing
 
 
@@ -2863,13 +2957,22 @@ def _positive_feature_pack_ready(root: Path) -> bool:
     return ready
 
 
+def _background_negative_pack_status(root: Path) -> tuple[bool, list[str]]:
+    missing = []
+    for split, directory in (
+        ("training", root / "training"),
+        ("validation_ambient", root / "validation_ambient"),
+        ("testing_ambient", root / "testing_ambient"),
+    ):
+        valid, reason = _validate_mmap_split_dir(directory)
+        if not valid:
+            missing.append(f"{split} ({reason})" if reason else split)
+    return (len(missing) == 0), missing
+
+
 def _background_negative_pack_ready(root: Path) -> bool:
-    required = (
-        root / "training",
-        root / "validation_ambient",
-        root / "testing_ambient",
-    )
-    return all(directory.exists() and _has_any_mmap_dir(directory) for directory in required)
+    ready, _ = _background_negative_pack_status(root)
+    return ready
 
 
 def step_check_env() -> bool:
@@ -3424,6 +3527,43 @@ def _intersection_size(left: set[str], right: set[str]) -> int:
     return len(left.intersection(right))
 
 
+def _is_positive_audio_usable(path: Path) -> bool:
+    import soundfile as sf
+
+    try:
+        sf.info(str(path))
+        return True
+    except Exception:
+        pass
+
+    try:
+        import audioread
+
+        with audioread.audio_open(str(path)):
+            return True
+    except Exception:
+        return False
+
+
+def _validate_mmap_split_dir(directory: Path) -> tuple[bool, str | None]:
+    if not directory.exists():
+        return False, "directory does not exist"
+
+    mmap_dirs = sorted(path for path in directory.glob("**/*_mmap") if path.is_dir())
+    if not mmap_dirs:
+        return False, "no mmap directories found"
+
+    from mmap_ninja.ragged import RaggedMmap
+
+    for mmap_path in mmap_dirs:
+        try:
+            RaggedMmap(str(mmap_path))
+        except Exception as exc:
+            return False, f"{mmap_path.name}: {exc}"
+
+    return True, None
+
+
 def step_audit_validation() -> bool:
     if not _check_micro_wake_word_import():
         return False
@@ -3801,7 +3941,8 @@ def step_generate_background_negative_features() -> bool:
         "apply_to_eval": bool(neg_cfg.get("apply_to_eval", False)),
     }
 
-    if _background_negative_pack_ready(features_dir) and manifest_path.exists():
+    ready, missing = _background_negative_pack_status(features_dir)
+    if ready and manifest_path.exists():
         try:
             current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -3811,6 +3952,12 @@ def step_generate_background_negative_features() -> bool:
             return True
 
     if features_dir.exists():
+        if not ready:
+            log.warning(
+                "  Existing generated background negative pack at %s is incomplete or invalid; rebuilding (%s).",
+                features_dir,
+                ", ".join(missing),
+            )
         shutil.rmtree(features_dir)
     features_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3970,10 +4117,16 @@ def step_train() -> bool:
             if not step_generate_positive_features():
                 return False
 
-        if _generated_background_negatives_enabled(cfg) and not _background_negative_pack_ready(_background_negative_features_dir(cfg)):
-            log.info("  Generated background negative features are missing; building them before training.")
-            if not step_generate_background_negative_features():
-                return False
+        if _generated_background_negatives_enabled(cfg):
+            generated_background_root = _background_negative_features_dir(cfg)
+            bg_ready, bg_missing = _background_negative_pack_status(generated_background_root)
+            if not bg_ready:
+                log.info(
+                    "  Generated background negative features are missing or invalid (%s); building them before training.",
+                    ", ".join(bg_missing),
+                )
+                if not step_generate_background_negative_features():
+                    return False
 
         training_config = _write_training_config(cfg)
         cmd = [
@@ -4089,7 +4242,7 @@ def step_export() -> bool:
     shutil.copy2(source, dest_model)
 
     manifest_cfg = cfg.get("esphome_manifest", {})
-    result_record = _load_latest_result_record()
+    result_record = _load_latest_successful_result_record(training_dir=train_dir)
     cutoff_strategy = str(manifest_cfg.get("probability_cutoff_strategy", "fixed")).strip().lower()
     probability_cutoff = float(manifest_cfg.get("probability_cutoff", 0.97))
     probability_cutoff_source = "config"
