@@ -44,21 +44,9 @@ Alternative Polish VAD presets:
 - `configs/polish_vad_balanced.yaml`: less conservative than the default, better balance of recall vs false activations
 - `configs/polish_vad_high_recall.yaml`: pushes recall harder, useful if the detector misses too much speech
 - `configs/polish_vad_low_fp.yaml`: prioritizes reducing ambient false positives, even if recall drops a bit
-- `configs/polish_vad_low_fp_stable.yaml`: low-FP preset with gentler learning-rate decay for more stable early checkpoints
-- `configs/polish_vad_public_large.yaml`: larger public-only bootstrap with more Polish speech and more background/noise clips
-- `configs/polish_vad_public_large_segpos.yaml`: `public_large` plus safe post-split segmentation of long positive clips and segmented background augmentation
 - `configs/polish_vad_public_research.yaml`: research preset that adds VoxPopuli PL, MLS Polish, and optional Sounds of Home negatives
-- `configs/polish_vad_public_large_v2.yaml`: tuned `public_large` with shorter schedule, denser evals, and slightly harder default negatives
-- `configs/polish_vad_public_large_balanced_v2.yaml`: `public_large` with a very light generated background-negative pack for a more cautious balanced run
-- `configs/polish_vad_public_large_bgneg.yaml`: `public_large` plus a generated negative mmap pack built from public background audio
-- `configs/polish_vad_public_large_bgneg_soft.yaml`: softer version of `public_large_bgneg` with lower generated-negative pressure
-- `configs/polish_vad_public_hybrid.yaml`: hybrid preset that mixes the wider public bootstrap with moderate hard-negative pressure
-- `configs/polish_vad_public_xlarge.yaml`: experimental extra-large public bootstrap for testing whether sheer dataset scale helps
-- `configs/polish_vad_strict.yaml`: stricter preset for lower false positives, based on the hard-negative direction
-- `configs/polish_vad_public_hardneg.yaml`: larger public bootstrap plus heavier hard-negatives for trying to get a bigger jump in false-positive robustness
-- `configs/polish_vad_public_hardneg_fast.yaml`: faster public hard-negative preset that skips the slowest optional background sources
-- `configs/polish_vad_very_low_fp.yaml`: aggressive low-FP preset for trying to get ambient false positives down further
-- both presets also use a larger batch size and CPU thread hints for better throughput on 8-core desktop CPUs
+
+Archived experimental presets were moved to `configs/archive/`. Keep them for reference, but start new experiments from the small set above.
 
 Examples:
 
@@ -66,20 +54,7 @@ Examples:
 python train_microwakeword.py --config configs/polish_vad_balanced.yaml
 python train_microwakeword.py --config configs/polish_vad_high_recall.yaml
 python train_microwakeword.py --config configs/polish_vad_low_fp.yaml
-python train_microwakeword.py --config configs/polish_vad_low_fp_stable.yaml
-python train_microwakeword.py --config configs/polish_vad_public_large.yaml
-python train_microwakeword.py --config configs/polish_vad_public_large_segpos.yaml
 python train_microwakeword.py --config configs/polish_vad_public_research.yaml
-python train_microwakeword.py --config configs/polish_vad_public_large_v2.yaml
-python train_microwakeword.py --config configs/polish_vad_public_large_balanced_v2.yaml
-python train_microwakeword.py --config configs/polish_vad_public_large_bgneg.yaml
-python train_microwakeword.py --config configs/polish_vad_public_large_bgneg_soft.yaml
-python train_microwakeword.py --config configs/polish_vad_public_hybrid.yaml
-python train_microwakeword.py --config configs/polish_vad_public_xlarge.yaml
-python train_microwakeword.py --config configs/polish_vad_strict.yaml
-python train_microwakeword.py --config configs/polish_vad_public_hardneg.yaml
-python train_microwakeword.py --config configs/polish_vad_public_hardneg_fast.yaml
-python train_microwakeword.py --config configs/polish_vad_very_low_fp.yaml
 python train_microwakeword.py --config configs/polish_vad_balanced.yaml --step audit-validation
 ```
 
@@ -158,16 +133,6 @@ Polish VAD presets because some recordings may still contain intelligible speech
 or announcements. You can re-enable it manually if you curate/filter those
 clips for your own setup.
 
-The `polish_vad_public_hardneg.yaml` preset is the widest public bootstrap and
-combines:
-
-- `audioset-nonspeech`
-- `speech-noise-dataset` with only `noise_only`
-- `WHAM!` noise clips
-- `MUSAN` from OpenSLR filtered to `music` and `noise`
-
-So the repository can now bootstrap a much larger public-only VAD setup without requiring your own recordings, although real device-specific recordings can still help later.
-
 For the bundled Polish VAD config, the default runtime is CPU because TensorFlow on WSL2 with very new NVIDIA GPUs can be unstable during the `train` step.
 
 The launcher still supports a more flexible runtime and:
@@ -206,6 +171,7 @@ python fetch_voice_pe_vad.py --model vad
 - `fetch_voice_pe_vad.py`: official model downloader
 - `configs/microwakeword_example.yaml`: example wake-word config
 - `configs/polish_vad.yaml`: example Polish VAD config
+- `configs/archive/`: archived experimental presets kept for reference
 
 ## Notes
 
