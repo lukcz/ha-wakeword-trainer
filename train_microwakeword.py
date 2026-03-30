@@ -86,6 +86,15 @@ _SESSION_LOG_FILE: io.TextIOWrapper | None = None
 _SESSION_CRASH_LOG_FILE: io.TextIOWrapper | None = None
 _SESSION_LOG_PATH: Path | None = None
 _LAST_INLINE_PROGRESS_LEN = 0
+_SUPPRESSED_SUBPROCESS_PATTERNS = [
+    re.compile(r"^WARNING: All log messages before absl::InitializeLog\(\) is called are written to STDERR$"),
+    re.compile(r"^[IWE]\d{4} .*port\.cc:153\] oneDNN custom operations are on\..*$"),
+    re.compile(r"^[IWE]\d{4} .*cpu_feature_guard\.cc:227\] This TensorFlow binary is optimized to use available CPU instructions.*$"),
+    re.compile(r"^To enable the following instructions: .*rebuild TensorFlow with the appropriate compiler flags\.$"),
+    re.compile(r"^UserWarning:$"),
+    re.compile(r"^\s+pkg_resources is deprecated as an API\..*$"),
+    re.compile(r"^\s+The pkg_resources package is slated for removal.*$"),
+]
 
 
 def _close_session_log_files() -> None:
@@ -170,6 +179,8 @@ def _run_with_live_output(
     assert process.stdout is not None
     for raw_line in process.stdout:
         line = raw_line.rstrip("\r\n")
+        if any(pattern.match(line) for pattern in _SUPPRESSED_SUBPROCESS_PATTERNS):
+            continue
         if line.startswith("INFO:absl:AUC ") or line.startswith("AUC "):
             value = line.rsplit(" ", 1)[-1]
             prefix = "INFO:absl:" if line.startswith("INFO:absl:AUC ") else ""
@@ -1207,6 +1218,9 @@ def _append_env_flag(env: dict[str, str], key: str, flag: str) -> None:
 def _build_training_env(cfg: dict, force_device: str | None = None) -> tuple[dict[str, str], str]:
     runtime = _runtime_cfg(cfg)
     env = os.environ.copy()
+    env.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    env.setdefault("GLOG_minloglevel", "2")
+    env.setdefault("ABSL_MIN_LOG_LEVEL", "2")
 
     device = str(force_device or runtime.get("device", "auto")).strip().lower()
     if device not in {"auto", "gpu", "cpu"}:
