@@ -170,6 +170,11 @@ def _run_with_live_output(
     assert process.stdout is not None
     for raw_line in process.stdout:
         line = raw_line.rstrip("\r\n")
+        if line.startswith("INFO:absl:AUC ") or line.startswith("AUC "):
+            value = line.rsplit(" ", 1)[-1]
+            prefix = "INFO:absl:" if line.startswith("INFO:absl:AUC ") else ""
+            line = f"{prefix}FRR-vs-FAPH area {value} (not ROC AUC; can exceed 1.0)"
+            raw_line = line + "\n"
         captured_lines.append(line)
         if _SESSION_LOG_FILE is not None:
             _SESSION_LOG_FILE.write(raw_line)
@@ -262,6 +267,132 @@ def _extract_training_validation_history(lines: list[str]) -> list[dict]:
     return history
 
 
+def _rank_validation_history(history: list[dict]) -> list[dict]:
+    ranked = sorted(
+        history,
+        key=lambda item: (
+            -float(item.get("average_viable_recall", float("-inf"))),
+            -float(item.get("recall_at_no_faph", float("-inf"))),
+            float(item.get("estimated_false_positives_per_hour", float("inf"))),
+            int(item.get("step", 0)),
+        ),
+    )
+    return [{"rank": index, **item} for index, item in enumerate(ranked, 1)]
+
+
+def _result_export_paths(model_name: str | None) -> dict[str, str] | None:
+    if not model_name:
+        return None
+    model_path = EXPORT_DIR / f"{model_name}.tflite"
+    manifest_path = EXPORT_DIR / f"{model_name}.json"
+    if not model_path.exists() and not manifest_path.exists():
+        return None
+    return {
+        "model": str(model_path) if model_path.exists() else None,
+        "manifest": str(manifest_path) if manifest_path.exists() else None,
+    }
+
+
+def _leaderboard_entry(result_path: Path, record: dict) -> dict:
+    best = record.get("best_validation") or {}
+    return {
+        "preset": record.get("preset"),
+        "model_name": record.get("model_name"),
+        "timestamp": record.get("timestamp"),
+        "config_file": record.get("config_file"),
+        "config_sha1": record.get("config_sha1"),
+        "result_file": str(result_path),
+        "session_log": record.get("session_log"),
+        "training_dir": record.get("training_dir"),
+        "export_paths": _result_export_paths(record.get("model_name")),
+        "best_validation": {
+            "step": best.get("step"),
+            "average_viable_recall": best.get("average_viable_recall"),
+            "recall_at_no_faph": best.get("recall_at_no_faph"),
+            "estimated_false_positives_per_hour": best.get("estimated_false_positives_per_hour"),
+            "cutoff": best.get("cutoff"),
+            "accuracy": best.get("accuracy"),
+            "auc": best.get("auc"),
+            "loss": best.get("loss"),
+        },
+    }
+
+
+def _leaderboard_sort_key(record: dict) -> tuple[float, float, float, str]:
+    best = record.get("best_validation") or {}
+    return (
+        -float(best.get("average_viable_recall", float("-inf"))),
+        -float(best.get("recall_at_no_faph", float("-inf"))),
+        float(best.get("estimated_false_positives_per_hour", float("inf"))),
+        str(record.get("preset", "")),
+    )
+
+
+def _write_results_indexes() -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    latest_result_paths = sorted(
+        path
+        for path in RESULTS_DIR.glob("*.json")
+        if not path.name.startswith("_")
+    )
+
+    records: list[tuple[Path, dict]] = []
+    for path in latest_result_paths:
+        try:
+            records.append((path, json.loads(path.read_text(encoding="utf-8"))))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("  Skipping unreadable result summary %s: %s", path, exc)
+
+    successful_records = [
+        (path, record)
+        for path, record in records
+        if record.get("status") == "success" and record.get("best_validation")
+    ]
+    successful_records.sort(key=lambda item: _leaderboard_sort_key(item[1]))
+
+    leaderboard_entries = [
+        _leaderboard_entry(path, record)
+        for path, record in successful_records
+    ]
+
+    positions = {str(path): index for index, (path, _) in enumerate(successful_records, 1)}
+    leader_path = str(successful_records[0][0]) if successful_records else None
+
+    for path, record in records:
+        updated = False
+        leaderboard_position = positions.get(str(path))
+        is_official_leader = str(path) == leader_path
+
+        if record.get("leaderboard_position") != leaderboard_position:
+            record["leaderboard_position"] = leaderboard_position
+            updated = True
+        if record.get("is_official_leader") != is_official_leader:
+            record["is_official_leader"] = is_official_leader
+            updated = True
+
+        if updated:
+            path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+    leaderboard_path = RESULTS_DIR / "_leaderboard.json"
+    leaderboard_path.write_text(json.dumps(leaderboard_entries, indent=2) + "\n", encoding="utf-8")
+
+    official_leader = leaderboard_entries[0] if leaderboard_entries else None
+    official_leader_path = RESULTS_DIR / "_official_leader.json"
+    official_leader_path.write_text(
+        json.dumps(
+            {
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "metric": "average_viable_recall",
+                "leader": official_leader,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_training_result_summary(
     cfg: dict,
     *,
@@ -277,7 +408,8 @@ def _write_training_result_summary(
             [],
         )
     )
-    best_validation = max(history, key=lambda item: item["average_viable_recall"], default=None)
+    checkpoint_ranking = _rank_validation_history(history)
+    best_validation = checkpoint_ranking[0] if checkpoint_ranking else None
     latest_validation = history[-1] if history else None
 
     record = {
@@ -302,12 +434,14 @@ def _write_training_result_summary(
         "best_validation": best_validation,
         "latest_validation": latest_validation,
         "validation_history": history,
+        "checkpoint_ranking": checkpoint_ranking,
         "config_snapshot": cfg,
     }
 
     latest_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     with open(history_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _write_results_indexes()
     log.info("  Saved training result summary to %s", latest_path)
     return latest_path
 
@@ -3646,6 +3780,7 @@ def step_export() -> bool:
     }
     dest_manifest = EXPORT_DIR / f"{cfg['model_name']}.json"
     dest_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    _write_results_indexes()
     log.info("  Exported %s and %s", dest_model, dest_manifest)
     return True
 
