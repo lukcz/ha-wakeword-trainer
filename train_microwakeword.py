@@ -61,6 +61,7 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 EXPORT_DIR = SCRIPT_DIR / "export"
 LOGS_DIR = OUTPUT_DIR / "_logs"
 RESULTS_DIR = OUTPUT_DIR / "_results"
+TRAINING_STATUS_PATH = RESULTS_DIR / "_training_status.json"
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
 TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
 MDC_PIP_SPEC = "datacollective>=0.4.5"
@@ -87,6 +88,9 @@ _SESSION_LOG_FILE: io.TextIOWrapper | None = None
 _SESSION_CRASH_LOG_FILE: io.TextIOWrapper | None = None
 _SESSION_LOG_PATH: Path | None = None
 _LAST_INLINE_PROGRESS_LEN = 0
+_LAST_RESULT_PATH: Path | None = None
+_MIRROR_ROOT_UNSET = object()
+_MIRROR_ROOT_CACHE: Path | None | object = _MIRROR_ROOT_UNSET
 _SUPPRESSED_SUBPROCESS_PATTERNS = [
     re.compile(r"^WARNING: All log messages before absl::InitializeLog\(\) is called are written to STDERR$"),
     re.compile(r"^[IWE]\d{4} .*port\.cc:153\] oneDNN custom operations are on\..*$"),
@@ -240,6 +244,96 @@ def _results_file_paths(config_path: Path) -> tuple[Path, Path]:
     latest_path = RESULTS_DIR / f"{config_path.stem}.json"
     history_path = RESULTS_DIR / f"{config_path.stem}.jsonl"
     return latest_path, history_path
+
+
+def _mirror_repo_root() -> Path | None:
+    global _MIRROR_ROOT_CACHE
+
+    if _MIRROR_ROOT_CACHE is not _MIRROR_ROOT_UNSET:
+        if isinstance(_MIRROR_ROOT_CACHE, Path):
+            return _MIRROR_ROOT_CACHE
+        return None
+
+    candidates: list[Path] = []
+    env_value = os.environ.get("HAWW_WINDOWS_MIRROR_ROOT")
+    if env_value:
+        candidates.append(Path(env_value).expanduser())
+    candidates.append(Path("/mnt/d/Github/ha-wakeword-trainer"))
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved == SCRIPT_DIR:
+            continue
+        if candidate.exists() and (candidate / ".git").exists():
+            _MIRROR_ROOT_CACHE = candidate
+            return candidate
+
+    _MIRROR_ROOT_CACHE = None
+    return None
+
+
+def _mirror_path(local_path: Path) -> Path | None:
+    mirror_root = _mirror_repo_root()
+    if mirror_root is None:
+        return None
+    try:
+        relative_path = local_path.resolve().relative_to(SCRIPT_DIR)
+    except ValueError:
+        return None
+    return mirror_root / relative_path
+
+
+def _mirror_file(local_path: Path) -> None:
+    if not local_path.exists():
+        return
+    dest_path = _mirror_path(local_path)
+    if dest_path is None:
+        return
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(local_path, dest_path)
+
+
+def _write_json_file(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _mirror_file(path)
+
+
+def _mirror_session_logs() -> None:
+    if _SESSION_LOG_PATH is not None:
+        _mirror_file(_SESSION_LOG_PATH)
+        _mirror_file(_SESSION_LOG_PATH.with_suffix(".crash.log"))
+
+
+def _write_training_status(
+    *,
+    active: bool,
+    pipeline_status: str,
+    current_step: str | None = None,
+    current_step_index: int | None = None,
+    total_steps: int | None = None,
+    error: str | None = None,
+    result_path: Path | None = None,
+) -> None:
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "active": active,
+        "pipeline_status": pipeline_status,
+        "preset": CONFIG_FILE.stem if CONFIG_FILE else None,
+        "config_file": str(CONFIG_FILE) if CONFIG_FILE else None,
+        "pid": os.getpid(),
+        "current_step": current_step,
+        "current_step_index": current_step_index,
+        "total_steps": total_steps,
+        "session_log": str(_SESSION_LOG_PATH) if _SESSION_LOG_PATH else None,
+        "result_file": str(result_path) if result_path else None,
+        "error": error,
+    }
+    _write_json_file(TRAINING_STATUS_PATH, payload)
+    _mirror_session_logs()
 
 
 def _config_sha1(path: Path) -> str:
@@ -462,24 +556,20 @@ def _write_results_indexes() -> None:
             updated = True
 
         if updated:
-            path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            _write_json_file(path, record)
 
     leaderboard_path = RESULTS_DIR / "_leaderboard.json"
-    leaderboard_path.write_text(json.dumps(leaderboard_entries, indent=2) + "\n", encoding="utf-8")
+    _write_json_file(leaderboard_path, leaderboard_entries)
 
     official_leader = leaderboard_entries[0] if leaderboard_entries else None
     official_leader_path = RESULTS_DIR / "_official_leader.json"
-    official_leader_path.write_text(
-        json.dumps(
-            {
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "metric": "average_viable_recall",
-                "leader": official_leader,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_json_file(
+        official_leader_path,
+        {
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "metric": "average_viable_recall",
+            "leader": official_leader,
+        },
     )
 
 
@@ -491,6 +581,7 @@ def _write_training_result_summary(
     attempts: list[dict],
     error: str | None = None,
 ) -> Path:
+    global _LAST_RESULT_PATH
     latest_path, history_path = _results_file_paths(CONFIG_FILE)
     history = _extract_training_validation_history(
         next(
@@ -532,10 +623,18 @@ def _write_training_result_summary(
         "config_snapshot": cfg,
     }
 
-    latest_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    _write_json_file(latest_path, record)
     with open(history_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _mirror_file(history_path)
+    _LAST_RESULT_PATH = latest_path
     _write_results_indexes()
+    _write_training_status(
+        active=status == "running",
+        pipeline_status=status,
+        result_path=latest_path,
+        error=error,
+    )
     log.info("  Saved training result summary to %s", latest_path)
     return latest_path
 
@@ -4468,6 +4567,14 @@ def run_pipeline(from_step: str | None = None, single_step: str | None = None) -
             return False
         name, fn, description = matches[0]
         log.info("STEP: %s - %s", name, description)
+        _write_training_status(
+            active=True,
+            pipeline_status="running",
+            current_step=name,
+            current_step_index=1,
+            total_steps=1,
+            result_path=_LAST_RESULT_PATH,
+        )
         return fn()
 
     steps_to_run = STEPS
@@ -4484,14 +4591,39 @@ def run_pipeline(from_step: str | None = None, single_step: str | None = None) -
         log.info("=" * 60)
         log.info("[%d/%d] %s - %s", index, total, name, description)
         log.info("=" * 60)
+        _write_training_status(
+            active=True,
+            pipeline_status="running",
+            current_step=name,
+            current_step_index=index,
+            total_steps=total,
+            result_path=_LAST_RESULT_PATH,
+        )
         if not fn():
             log.error("[%d/%d] %s FAILED", index, total, name)
             log.error("Pipeline stopped. Resume with:")
             log.error("  python train_microwakeword.py --from %s", name)
+            _write_training_status(
+                active=False,
+                pipeline_status="failed",
+                current_step=name,
+                current_step_index=index,
+                total_steps=total,
+                result_path=_LAST_RESULT_PATH,
+                error=f"Step failed: {name}",
+            )
             return False
         log.info("[%d/%d] %s PASSED", index, total, name)
 
     log.info("All steps complete.")
+    _write_training_status(
+        active=False,
+        pipeline_status="success",
+        current_step=steps_to_run[-1][0] if steps_to_run else None,
+        current_step_index=total if steps_to_run else None,
+        total_steps=total if steps_to_run else None,
+        result_path=_LAST_RESULT_PATH,
+    )
     return True
 
 
@@ -4532,8 +4664,28 @@ def main() -> None:
     log.info("Crash log file: %s", session_log_path.with_suffix(".crash.log"))
     log.info("Working directory: %s", Path.cwd())
     log.info("Config file: %s", CONFIG_FILE)
+    _write_training_status(active=True, pipeline_status="starting", result_path=_LAST_RESULT_PATH)
 
-    ok = run_pipeline(from_step=args.from_step, single_step=args.step)
+    ok = False
+    error_message: str | None = None
+    try:
+        ok = run_pipeline(from_step=args.from_step, single_step=args.step)
+    except Exception as exc:
+        error_message = str(exc)
+        _write_training_status(
+            active=False,
+            pipeline_status="crashed",
+            result_path=_LAST_RESULT_PATH,
+            error=error_message,
+        )
+        raise
+    else:
+        _write_training_status(
+            active=False,
+            pipeline_status="success" if ok else "failed",
+            result_path=_LAST_RESULT_PATH,
+            error=error_message,
+        )
     sys.exit(0 if ok else 1)
 
 

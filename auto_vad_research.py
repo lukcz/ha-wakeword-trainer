@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import subprocess
 import sys
 import time
@@ -20,6 +21,9 @@ RESULTS_DIR = REPO_ROOT / "output" / "_results"
 LOGS_DIR = REPO_ROOT / "output" / "_logs"
 STATE_PATH = RESULTS_DIR / "_auto_vad_research_state.json"
 LEADERBOARD_PATH = RESULTS_DIR / "_leaderboard.json"
+RUNNER_STATUS_PATH = RESULTS_DIR / "_auto_vad_research_status.json"
+_MIRROR_ROOT_UNSET = object()
+_MIRROR_ROOT_CACHE: Path | None | object = _MIRROR_ROOT_UNSET
 
 STATIC_PRIORITY = [
     "polish_vad_public_research_gainwide_earlydense",
@@ -47,6 +51,57 @@ def _load_json(path: Path, default):
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _mirror_file(path)
+
+
+def _mirror_repo_root() -> Path | None:
+    global _MIRROR_ROOT_CACHE
+
+    if _MIRROR_ROOT_CACHE is not _MIRROR_ROOT_UNSET:
+        if isinstance(_MIRROR_ROOT_CACHE, Path):
+            return _MIRROR_ROOT_CACHE
+        return None
+
+    candidates: list[Path] = []
+    env_value = os.environ.get("HAWW_WINDOWS_MIRROR_ROOT")
+    if env_value:
+        candidates.append(Path(env_value).expanduser())
+    candidates.append(Path("/mnt/d/Github/ha-wakeword-trainer"))
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved == REPO_ROOT:
+            continue
+        if candidate.exists() and (candidate / ".git").exists():
+            _MIRROR_ROOT_CACHE = candidate
+            return candidate
+
+    _MIRROR_ROOT_CACHE = None
+    return None
+
+
+def _mirror_path(local_path: Path) -> Path | None:
+    mirror_root = _mirror_repo_root()
+    if mirror_root is None:
+        return None
+    try:
+        relative_path = local_path.resolve().relative_to(REPO_ROOT)
+    except ValueError:
+        return None
+    return mirror_root / relative_path
+
+
+def _mirror_file(local_path: Path) -> None:
+    if not local_path.exists():
+        return
+    dest_path = _mirror_path(local_path)
+    if dest_path is None:
+        return
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(local_path.read_bytes())
 
 
 def _load_state() -> dict:
@@ -55,6 +110,14 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     _write_json(STATE_PATH, state)
+
+
+def _write_runner_status(**fields) -> None:
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        **fields,
+    }
+    _write_json(RUNNER_STATUS_PATH, payload)
 
 
 def _load_leaderboard() -> list[dict]:
@@ -296,21 +359,46 @@ def main() -> int:
     while True:
         running = _running_training_processes()
         if running:
+            _write_runner_status(
+                active=True,
+                phase="waiting_for_training",
+                running_training_processes=running,
+                launched_count=len(state.get("launched", [])),
+            )
             print(f"[{time.strftime('%F %T')}] Training already running; waiting {args.poll_seconds}s", flush=True)
             time.sleep(args.poll_seconds)
             continue
 
         launched = state.get("launched", [])
         if len(launched) >= args.max_launches:
+            _write_runner_status(
+                active=False,
+                phase="idle",
+                reason=f"Reached max launches ({args.max_launches})",
+                launched_count=len(launched),
+            )
             print(f"[{time.strftime('%F %T')}] Reached max launches ({args.max_launches}); exiting", flush=True)
             return 0
 
         config_path, reason = _next_candidate(state)
         if config_path is None:
+            _write_runner_status(
+                active=False,
+                phase="idle",
+                reason=reason,
+                launched_count=len(launched),
+            )
             print(f"[{time.strftime('%F %T')}] {reason}; exiting", flush=True)
             return 0
 
         stem = config_path.stem
+        _write_runner_status(
+            active=True,
+            phase="launching",
+            next_preset=stem,
+            reason=reason,
+            launched_count=len(launched),
+        )
         print(f"[{time.strftime('%F %T')}] Next preset: {stem} ({reason})", flush=True)
         state.setdefault("launched", []).append(
             {
@@ -323,6 +411,13 @@ def main() -> int:
         _save_state(state)
 
         returncode = _launch_training(config_path, dry_run=args.dry_run)
+        _write_runner_status(
+            active=True,
+            phase="post_run",
+            last_preset=stem,
+            last_returncode=returncode,
+            launched_count=len(state.get("launched", [])),
+        )
         print(f"[{time.strftime('%F %T')}] Finished {stem} with rc={returncode}", flush=True)
 
         if args.dry_run:
