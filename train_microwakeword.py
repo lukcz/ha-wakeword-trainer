@@ -85,6 +85,7 @@ log = logging.getLogger("train_microwakeword")
 _SESSION_LOG_FILE: io.TextIOWrapper | None = None
 _SESSION_CRASH_LOG_FILE: io.TextIOWrapper | None = None
 _SESSION_LOG_PATH: Path | None = None
+_LAST_INLINE_PROGRESS_LEN = 0
 
 
 def _close_session_log_files() -> None:
@@ -165,16 +166,27 @@ def _run_with_live_output(
     )
 
     captured_lines: list[str] = []
+    inline_progress_active = False
     assert process.stdout is not None
     for raw_line in process.stdout:
-        captured_lines.append(raw_line.rstrip("\r\n"))
-        sys.stdout.write(raw_line)
-        sys.stdout.flush()
+        line = raw_line.rstrip("\r\n")
+        captured_lines.append(line)
         if _SESSION_LOG_FILE is not None:
             _SESSION_LOG_FILE.write(raw_line)
             _SESSION_LOG_FILE.flush()
+        if _supports_inline_progress() and _is_inline_subprocess_progress_line(line):
+            _write_inline_progress(line)
+            inline_progress_active = True
+            continue
+        if inline_progress_active:
+            _finish_inline_progress()
+            inline_progress_active = False
+        sys.stdout.write(raw_line)
+        sys.stdout.flush()
 
     process.stdout.close()
+    if inline_progress_active:
+        _finish_inline_progress()
     return process.wait(), captured_lines
 
 
@@ -305,17 +317,31 @@ def _supports_inline_progress() -> bool:
 
 
 def _write_inline_progress(message: str) -> None:
+    global _LAST_INLINE_PROGRESS_LEN
     if not _supports_inline_progress():
         return
-    sys.stdout.write(f"\r{message}")
+    clean_message = message.rstrip("\r\n")
+    padding = " " * max(0, _LAST_INLINE_PROGRESS_LEN - len(clean_message))
+    sys.stdout.write(f"\r{clean_message}{padding}")
     sys.stdout.flush()
+    _LAST_INLINE_PROGRESS_LEN = len(clean_message)
 
 
 def _finish_inline_progress() -> None:
+    global _LAST_INLINE_PROGRESS_LEN
     if not _supports_inline_progress():
         return
     sys.stdout.write("\n")
     sys.stdout.flush()
+    _LAST_INLINE_PROGRESS_LEN = 0
+
+
+def _is_inline_subprocess_progress_line(line: str) -> bool:
+    if not line:
+        return False
+    if line.startswith(("Validation Batch #", "Training Batch #", "Train Batch #", "Testing Batch #")):
+        return True
+    return "Mini-Batch #" in line and "Batch #" in line
 
 
 def _extract_zip_with_external_tools(archive_path: Path, extract_dir: Path) -> bool:
