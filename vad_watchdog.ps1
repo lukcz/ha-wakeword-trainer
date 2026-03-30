@@ -14,13 +14,13 @@ New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 
 while ($true) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz"
-    Add-Content -Path $logPath -Value "[$timestamp] Starting auto_vad_research.py"
+    Add-Content -Path $logPath -Value "[$timestamp] Starting vad_orchestrator.py"
 
-    & wsl.exe bash -lc "cd $WslRepo && .venv/bin/python auto_vad_research.py --max-launches 999 --poll-seconds $PollSeconds" >> $logPath 2>&1
+    & wsl.exe bash -lc "cd $WslRepo && exec .venv/bin/python vad_orchestrator.py --poll-seconds $PollSeconds"
     $returnCode = $LASTEXITCODE
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz"
-    Add-Content -Path $logPath -Value "[$timestamp] auto_vad_research.py exited with rc=$returnCode; restarting in $RestartDelaySeconds seconds"
+    Add-Content -Path $logPath -Value "[$timestamp] vad_orchestrator.py exited with rc=$returnCode; restarting in $RestartDelaySeconds seconds"
 
     Start-Sleep -Seconds $RestartDelaySeconds
 }

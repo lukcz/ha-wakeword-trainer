@@ -61,7 +61,6 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 EXPORT_DIR = SCRIPT_DIR / "export"
 LOGS_DIR = OUTPUT_DIR / "_logs"
 RESULTS_DIR = OUTPUT_DIR / "_results"
-TRAINING_STATUS_PATH = RESULTS_DIR / "_training_status.json"
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
 TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
 MDC_PIP_SPEC = "datacollective>=0.4.5"
@@ -105,6 +104,9 @@ _SUPPRESSED_SUBPROCESS_PATTERNS = [
 def _close_session_log_files() -> None:
     global _SESSION_LOG_FILE, _SESSION_CRASH_LOG_FILE, _SESSION_LOG_PATH
 
+    mirror_logs = globals().get("_mirror_session_logs")
+    if callable(mirror_logs):
+        mirror_logs()
     for handle_name in ("_SESSION_LOG_FILE", "_SESSION_CRASH_LOG_FILE"):
         handle = globals().get(handle_name)
         if handle is None:
@@ -298,7 +300,9 @@ def _mirror_file(local_path: Path) -> None:
 
 def _write_json_file(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
     _mirror_file(path)
 
 
@@ -306,34 +310,6 @@ def _mirror_session_logs() -> None:
     if _SESSION_LOG_PATH is not None:
         _mirror_file(_SESSION_LOG_PATH)
         _mirror_file(_SESSION_LOG_PATH.with_suffix(".crash.log"))
-
-
-def _write_training_status(
-    *,
-    active: bool,
-    pipeline_status: str,
-    current_step: str | None = None,
-    current_step_index: int | None = None,
-    total_steps: int | None = None,
-    error: str | None = None,
-    result_path: Path | None = None,
-) -> None:
-    payload = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "active": active,
-        "pipeline_status": pipeline_status,
-        "preset": CONFIG_FILE.stem if CONFIG_FILE else None,
-        "config_file": str(CONFIG_FILE) if CONFIG_FILE else None,
-        "pid": os.getpid(),
-        "current_step": current_step,
-        "current_step_index": current_step_index,
-        "total_steps": total_steps,
-        "session_log": str(_SESSION_LOG_PATH) if _SESSION_LOG_PATH else None,
-        "result_file": str(result_path) if result_path else None,
-        "error": error,
-    }
-    _write_json_file(TRAINING_STATUS_PATH, payload)
-    _mirror_session_logs()
 
 
 def _config_sha1(path: Path) -> str:
@@ -629,12 +605,7 @@ def _write_training_result_summary(
     _mirror_file(history_path)
     _LAST_RESULT_PATH = latest_path
     _write_results_indexes()
-    _write_training_status(
-        active=status == "running",
-        pipeline_status=status,
-        result_path=latest_path,
-        error=error,
-    )
+    _mirror_session_logs()
     log.info("  Saved training result summary to %s", latest_path)
     return latest_path
 
@@ -4567,14 +4538,6 @@ def run_pipeline(from_step: str | None = None, single_step: str | None = None) -
             return False
         name, fn, description = matches[0]
         log.info("STEP: %s - %s", name, description)
-        _write_training_status(
-            active=True,
-            pipeline_status="running",
-            current_step=name,
-            current_step_index=1,
-            total_steps=1,
-            result_path=_LAST_RESULT_PATH,
-        )
         return fn()
 
     steps_to_run = STEPS
@@ -4591,39 +4554,14 @@ def run_pipeline(from_step: str | None = None, single_step: str | None = None) -
         log.info("=" * 60)
         log.info("[%d/%d] %s - %s", index, total, name, description)
         log.info("=" * 60)
-        _write_training_status(
-            active=True,
-            pipeline_status="running",
-            current_step=name,
-            current_step_index=index,
-            total_steps=total,
-            result_path=_LAST_RESULT_PATH,
-        )
         if not fn():
             log.error("[%d/%d] %s FAILED", index, total, name)
             log.error("Pipeline stopped. Resume with:")
             log.error("  python train_microwakeword.py --from %s", name)
-            _write_training_status(
-                active=False,
-                pipeline_status="failed",
-                current_step=name,
-                current_step_index=index,
-                total_steps=total,
-                result_path=_LAST_RESULT_PATH,
-                error=f"Step failed: {name}",
-            )
             return False
         log.info("[%d/%d] %s PASSED", index, total, name)
 
     log.info("All steps complete.")
-    _write_training_status(
-        active=False,
-        pipeline_status="success",
-        current_step=steps_to_run[-1][0] if steps_to_run else None,
-        current_step_index=total if steps_to_run else None,
-        total_steps=total if steps_to_run else None,
-        result_path=_LAST_RESULT_PATH,
-    )
     return True
 
 
@@ -4664,28 +4602,12 @@ def main() -> None:
     log.info("Crash log file: %s", session_log_path.with_suffix(".crash.log"))
     log.info("Working directory: %s", Path.cwd())
     log.info("Config file: %s", CONFIG_FILE)
-    _write_training_status(active=True, pipeline_status="starting", result_path=_LAST_RESULT_PATH)
 
     ok = False
-    error_message: str | None = None
     try:
         ok = run_pipeline(from_step=args.from_step, single_step=args.step)
-    except Exception as exc:
-        error_message = str(exc)
-        _write_training_status(
-            active=False,
-            pipeline_status="crashed",
-            result_path=_LAST_RESULT_PATH,
-            error=error_message,
-        )
-        raise
-    else:
-        _write_training_status(
-            active=False,
-            pipeline_status="success" if ok else "failed",
-            result_path=_LAST_RESULT_PATH,
-            error=error_message,
-        )
+    finally:
+        _mirror_session_logs()
     sys.exit(0 if ok else 1)
 
 
