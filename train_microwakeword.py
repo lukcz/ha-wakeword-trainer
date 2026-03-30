@@ -893,12 +893,39 @@ def _as_numpy(value):
 
 """
 
+    early_stopping_helper = """
+def _early_stopping_cfg(config):
+    cfg = config.get("early_stopping") or {}
+    return {
+        "enabled": bool(cfg.get("enabled", False)) and int(cfg.get("patience_evals", 0)) > 0,
+        "metric": str(cfg.get("metric", config.get("maximization_metric", "average_viable_recall"))),
+        "min_training_steps": int(cfg.get("min_training_steps", 0)),
+        "patience_evals": int(cfg.get("patience_evals", 0)),
+        "min_delta_absolute": float(cfg.get("min_delta_absolute", 0.0)),
+        "min_delta_relative": float(cfg.get("min_delta_relative", 0.0)),
+    }
+
+
+def _meaningful_metric_improvement(current_value, best_value, min_delta_absolute, min_delta_relative):
+    if best_value is None:
+        return True
+    threshold = max(float(min_delta_absolute), abs(float(best_value)) * float(min_delta_relative))
+    return float(current_value) > float(best_value) + threshold
+
+
+"""
+
     marker = "def validate_nonstreaming(config, data_processor, model, test_set):\n"
     if "_as_numpy(value):" not in updated:
         if marker not in updated:
             log.error("  Could not patch microWakeWord train.py: validate_nonstreaming marker not found")
             return False
         updated = updated.replace(marker, helper + marker, 1)
+    if "_early_stopping_cfg(config):" not in updated:
+        if marker not in updated:
+            log.error("  Could not patch microWakeWord train.py: validate_nonstreaming marker not found for early stopping helper")
+            return False
+        updated = updated.replace(marker, early_stopping_helper + marker, 1)
 
     replacements = {
         'result["fp"].numpy()': '_as_numpy(result["fp"])',
@@ -910,11 +937,99 @@ def _as_numpy(value):
     for old, new in replacements.items():
         updated = updated.replace(old, new)
 
+    loop_state_marker = """    best_minimization_quantity = 10000
+    best_maximization_quantity = 0.0
+    best_no_faph_cutoff = 1.0
+
+    for training_step in range(1, training_steps_max + 1):
+"""
+    loop_state_replacement = """    best_minimization_quantity = 10000
+    best_maximization_quantity = 0.0
+    best_no_faph_cutoff = 1.0
+
+    early_stopping = _early_stopping_cfg(config)
+    early_stop_metric = early_stopping["metric"]
+    early_stop_best_quantity = None
+    early_stop_best_step = 0
+    early_stop_no_improve_evals = 0
+    if early_stopping["enabled"]:
+        logging.info(
+            "Early stopping enabled: metric=%s min_training_steps=%d patience_evals=%d min_delta_absolute=%.6f min_delta_relative=%.6f",
+            early_stop_metric,
+            early_stopping["min_training_steps"],
+            early_stopping["patience_evals"],
+            early_stopping["min_delta_absolute"],
+            early_stopping["min_delta_relative"],
+        )
+
+    for training_step in range(1, training_steps_max + 1):
+"""
+    if loop_state_marker in updated and "early_stop_best_quantity = None" not in updated:
+        updated = updated.replace(loop_state_marker, loop_state_replacement, 1)
+
+    early_stop_marker = """            logging.info(
+                "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
+                best_minimization_quantity,
+                (best_maximization_quantity * 100),
+                best_no_faph_cutoff,
+            )
+"""
+    early_stop_replacement = """            logging.info(
+                "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
+                best_minimization_quantity,
+                (best_maximization_quantity * 100),
+                best_no_faph_cutoff,
+            )
+
+            if early_stopping["enabled"]:
+                current_early_stop_quantity = nonstreaming_metrics.get(early_stop_metric)
+                if current_early_stop_quantity is None:
+                    logging.warning(
+                        "Early stopping metric %s is unavailable; disabling early stopping for this run",
+                        early_stop_metric,
+                    )
+                    early_stopping["enabled"] = False
+                elif _meaningful_metric_improvement(
+                    current_early_stop_quantity,
+                    early_stop_best_quantity,
+                    early_stopping["min_delta_absolute"],
+                    early_stopping["min_delta_relative"],
+                ):
+                    early_stop_best_quantity = current_early_stop_quantity
+                    early_stop_best_step = training_step
+                    early_stop_no_improve_evals = 0
+                elif training_step >= early_stopping["min_training_steps"]:
+                    early_stop_no_improve_evals += 1
+                    logging.info(
+                        "Early stopping watch: no meaningful %s improvement for %d/%d evals (best %.9f at step %d; current %.9f)",
+                        early_stop_metric,
+                        early_stop_no_improve_evals,
+                        early_stopping["patience_evals"],
+                        early_stop_best_quantity,
+                        early_stop_best_step,
+                        current_early_stop_quantity,
+                    )
+                    if early_stop_no_improve_evals >= early_stopping["patience_evals"]:
+                        logging.info(
+                            "Early stopping triggered at step %d after %d evals without meaningful %s improvement (best %.9f at step %d; min delta abs %.6f rel %.6f)",
+                            training_step,
+                            early_stop_no_improve_evals,
+                            early_stop_metric,
+                            early_stop_best_quantity,
+                            early_stop_best_step,
+                            early_stopping["min_delta_absolute"],
+                            early_stopping["min_delta_relative"],
+                        )
+                        break
+"""
+    if early_stop_marker in updated and "Early stopping watch:" not in updated:
+        updated = updated.replace(early_stop_marker, early_stop_replacement, 1)
+
     if updated == original:
         return True
 
     train_py.write_text(updated, encoding="utf-8")
-    log.info("  Patched microWakeWord metric compatibility in %s", train_py)
+    log.info("  Patched microWakeWord training compatibility in %s", train_py)
     return True
 
 
@@ -1380,6 +1495,45 @@ def _resolve_augmentation_probabilities(raw_probabilities: dict) -> dict:
 
 def _runtime_cfg(cfg: dict) -> dict:
     return cfg.get("runtime", {}) or {}
+
+
+def _early_stopping_cfg(cfg: dict) -> dict:
+    training_cfg = cfg.get("training", {}) or {}
+    raw = training_cfg.get("early_stopping", {}) or {}
+    if not raw:
+        return {}
+
+    try:
+        patience_evals = int(raw.get("patience_evals", 0))
+    except (TypeError, ValueError):
+        patience_evals = 0
+
+    try:
+        min_training_steps = int(raw.get("min_training_steps", 0))
+    except (TypeError, ValueError):
+        min_training_steps = 0
+
+    try:
+        min_delta_absolute = float(raw.get("min_delta_absolute", 0.0))
+    except (TypeError, ValueError):
+        min_delta_absolute = 0.0
+
+    try:
+        min_delta_relative = float(raw.get("min_delta_relative", 0.0))
+    except (TypeError, ValueError):
+        min_delta_relative = 0.0
+
+    metric = str(raw.get("metric", training_cfg.get("maximization_metric", "average_viable_recall"))).strip()
+    enabled = bool(raw.get("enabled", False)) and patience_evals > 0
+
+    return {
+        "enabled": enabled,
+        "metric": metric or "average_viable_recall",
+        "patience_evals": max(0, patience_evals),
+        "min_training_steps": max(0, min_training_steps),
+        "min_delta_absolute": max(0.0, min_delta_absolute),
+        "min_delta_relative": max(0.0, min_delta_relative),
+    }
 
 
 def _append_env_flag(env: dict[str, str], key: str, flag: str) -> None:
@@ -4015,6 +4169,7 @@ def _write_training_config(cfg: dict) -> Path:
     feature_root = _positive_features_dir(cfg)
     neg_root = _negative_datasets_dir(cfg)
     train_cfg = cfg.get("training", {})
+    early_stopping_cfg = _early_stopping_cfg(cfg)
 
     negative_entries = []
     weights = cfg.get("negative_feature_weights", {})
@@ -4074,6 +4229,8 @@ def _write_training_config(cfg: dict) -> Path:
         "minimization_metric": train_cfg.get("minimization_metric"),
         "maximization_metric": train_cfg.get("maximization_metric", "average_viable_recall"),
     }
+    if early_stopping_cfg:
+        config["early_stopping"] = early_stopping_cfg
 
     out = _project_dir(cfg) / "training_parameters.yaml"
     out.parent.mkdir(parents=True, exist_ok=True)

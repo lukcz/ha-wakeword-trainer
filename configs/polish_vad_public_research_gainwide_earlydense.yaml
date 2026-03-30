@@ -169,6 +169,13 @@ training:
   time_mask_count: [0]
   freq_mask_max_size: [0]
   freq_mask_count: [0]
+  early_stopping:
+    enabled: true
+    metric: "average_viable_recall"
+    min_training_steps: 3000
+    patience_evals: 6
+    min_delta_absolute: 0.004
+    min_delta_relative: 0.005
 
 esphome_manifest:
   probability_cutoff: 0.5
