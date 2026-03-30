@@ -798,6 +798,20 @@ def _resolve_io_workers(cfg: dict | None = None, default: int = 4) -> int:
     return max(1, int(cfg.get("io_workers", default)))
 
 
+def _resolve_clip_limit(raw_value, default: int | None = None) -> int | None:
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        if normalized in {"", "none", "null", "all", "unlimited"}:
+            return None
+        raw_value = normalized
+    value = int(raw_value)
+    if value <= 0:
+        return None
+    return value
+
+
 def _resolve_bootstrap_workers(cfg: dict | None = None, default: int = 3) -> int:
     if not cfg:
         return default
@@ -964,7 +978,7 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
 
     repo = str(dataset_cfg["hf_repo"])
     output_dir = _resolve_path(str(dataset_cfg["output_dir"]))
-    max_clips = int(dataset_cfg.get("max_clips", 1200))
+    max_clips = _resolve_clip_limit(dataset_cfg.get("max_clips"), 1200)
     split = str(dataset_cfg.get("split", "train"))
     hf_config = dataset_cfg.get("hf_config")
     audio_column = str(dataset_cfg.get("audio_column", "audio"))
@@ -992,7 +1006,7 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
         return load_dataset(repo, split=split_name, streaming=streaming, **dataset_kwargs)
 
     for split_name in _split_spec_parts(split):
-        if count >= max_clips:
+        if max_clips is not None and count >= max_clips:
             break
 
         dataset = None
@@ -1007,7 +1021,7 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
             _iter_filtered_dataset(dataset, dataset_cfg),
             output_dir,
             prefix,
-            max_clips - count,
+            None if max_clips is None else max_clips - count,
             io_workers,
             audio_column=audio_column,
             segment_duration_s=float(segment_duration_s) if segment_duration_s else None,
@@ -1054,7 +1068,7 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
     from datacollective import download_dataset
 
     output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/common_voice_pl")))
-    max_clips = int(dataset_cfg.get("max_clips", 1200))
+    max_clips = _resolve_clip_limit(dataset_cfg.get("max_clips"), 1200)
     prefix = str(dataset_cfg.get("prefix", "common_voice"))
     locale = str(dataset_cfg.get("locale", dataset_cfg.get("hf_config", "pl"))).strip().lower()
     version = str(dataset_cfg.get("version", "25.0")).strip()
@@ -1230,7 +1244,7 @@ def _iter_common_voice_relative_paths(dataset_root: Path) -> list[str]:
     return [path.name for path in sorted(_safe_iter_audio_files(clips_root))]
 
 
-def _copy_common_voice_audio_subset(dataset_root: Path, output_dir: Path, *, prefix: str, max_clips: int) -> int:
+def _copy_common_voice_audio_subset(dataset_root: Path, output_dir: Path, *, prefix: str, max_clips: int | None) -> int:
     clips_root = dataset_root / "clips"
     if not clips_root.exists():
         raise FileNotFoundError(f"Expected Common Voice clips directory not found: {clips_root}")
@@ -1238,7 +1252,7 @@ def _copy_common_voice_audio_subset(dataset_root: Path, output_dir: Path, *, pre
     count = 0
     seen_paths: set[Path] = set()
     for relative_path in _iter_common_voice_relative_paths(dataset_root):
-        if count >= max_clips:
+        if max_clips is not None and count >= max_clips:
             break
         source = clips_root / relative_path
         if not source.exists() or source in seen_paths:
@@ -1293,7 +1307,7 @@ def _download_wham_dataset(dataset_cfg: dict) -> None:
 
 def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
     output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/mls_polish")))
-    max_clips = int(dataset_cfg.get("max_clips", 4000))
+    max_clips = _resolve_clip_limit(dataset_cfg.get("max_clips"), 4000)
     archive_dir = DATA_DIR / "_archives"
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / "mls_polish.tar.gz"
@@ -1321,7 +1335,7 @@ def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
     _reset_dir(output_dir)
     count = 0
     for audio_file in _safe_iter_audio_files(audio_root):
-        if count >= max_clips:
+        if max_clips is not None and count >= max_clips:
             break
         dest = output_dir / f"mls_polish_{count:06d}{audio_file.suffix.lower()}"
         shutil.copy2(audio_file, dest)
@@ -1372,7 +1386,7 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
     from datasets import load_dataset
 
     output_dir = _resolve_path(str(dataset_cfg.get("output_dir", "data/bigos")))
-    max_clips = int(dataset_cfg.get("max_clips", 2000))
+    max_clips = _resolve_clip_limit(dataset_cfg.get("max_clips"), 2000)
     split = str(dataset_cfg.get("split", "train"))
     hf_config = str(dataset_cfg.get("hf_config", "all"))
     io_workers = _resolve_io_workers(dataset_cfg)
@@ -1926,7 +1940,7 @@ def _download_musan_openslr(dest: Path) -> None:
     log.info("  Prepared %d MUSAN music/noise files in %s", copied, dest)
 
 
-def _download_audioset_subset(dest: Path, limit: int = 300, io_workers: int = 4) -> None:
+def _download_audioset_subset(dest: Path, limit: int | None = 300, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
     if _bootstrap_audio_dir_verified(dest, description="AudioSet subset"):
@@ -1945,7 +1959,7 @@ def _download_audioset_subset(dest: Path, limit: int = 300, io_workers: int = 4)
     log.info("  Saved %d AudioSet clips", count)
 
 
-def _download_fma_subset(dest: Path, limit: int = 200, io_workers: int = 4) -> None:
+def _download_fma_subset(dest: Path, limit: int | None = 200, io_workers: int = 4) -> None:
     from datasets import load_dataset
 
     if _bootstrap_audio_dir_verified(dest, description="FMA subset"):
@@ -1969,7 +1983,7 @@ def _download_fma_subset(dest: Path, limit: int = 200, io_workers: int = 4) -> N
         dataset = load_dataset(
             "rudraml/fma",
             name="small",
-            split=f"train[:{limit}]",
+            split="train" if limit is None else f"train[:{limit}]",
             streaming=False,
             trust_remote_code=True,
         )
@@ -2106,8 +2120,8 @@ def step_download_assets() -> bool:
     cfg = _load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     asset_cfg = cfg.get("asset_subsets", {}) or {}
-    audioset_max_clips = int(asset_cfg.get("audioset_max_clips", 300))
-    fma_max_clips = int(asset_cfg.get("fma_max_clips", 200))
+    audioset_max_clips = _resolve_clip_limit(asset_cfg.get("audioset_max_clips"), 300)
+    fma_max_clips = _resolve_clip_limit(asset_cfg.get("fma_max_clips"), 200)
     io_workers = _resolve_io_workers(asset_cfg)
 
     try:
