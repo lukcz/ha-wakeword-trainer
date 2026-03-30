@@ -82,23 +82,27 @@ def _find_config_path(stem: str) -> Path | None:
 
 
 def _running_training_processes() -> list[str]:
-    result = subprocess.run(
-        ["bash", "-lc", "pgrep -af 'python .*train_microwakeword.py' || true"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    lines = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
+    lines: list[str] = []
+    proc_root = Path("/proc")
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
             continue
-        if "auto_vad_research.py" in line:
+        cmdline_path = entry / "cmdline"
+        try:
+            raw = cmdline_path.read_bytes()
+        except OSError:
             continue
-        lines.append(line)
+        if not raw:
+            continue
+        argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\x00") if part]
+        if not argv:
+            continue
+        joined = " ".join(argv)
+        if "auto_vad_research.py" in joined:
+            continue
+        if "train_microwakeword.py" not in joined:
+            continue
+        lines.append(f"{entry.name} {joined}")
     return lines
 
 
