@@ -337,6 +337,29 @@ def _leaderboard_entry(result_path: Path, record: dict) -> dict:
     }
 
 
+def _load_latest_result_record(config_path: Path | None = None) -> dict | None:
+    latest_path, _ = _results_file_paths(config_path or CONFIG_FILE)
+    if not latest_path.exists():
+        return None
+    try:
+        return json.loads(latest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _recommended_probability_cutoff(record: dict | None) -> float | None:
+    if not record:
+        return None
+    best = record.get("best_validation") or {}
+    cutoff = best.get("cutoff")
+    if cutoff is None:
+        return None
+    try:
+        return float(cutoff)
+    except (TypeError, ValueError):
+        return None
+
+
 def _leaderboard_sort_key(record: dict) -> tuple[float, float, float, str]:
     best = record.get("best_validation") or {}
     return (
@@ -430,6 +453,9 @@ def _write_training_result_summary(
     checkpoint_ranking = _rank_validation_history(history)
     best_validation = checkpoint_ranking[0] if checkpoint_ranking else None
     latest_validation = history[-1] if history else None
+    recommended_probability_cutoff = _recommended_probability_cutoff(
+        {"best_validation": best_validation} if best_validation else None
+    )
 
     record = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -452,6 +478,7 @@ def _write_training_result_summary(
         ],
         "best_validation": best_validation,
         "latest_validation": latest_validation,
+        "recommended_probability_cutoff": recommended_probability_cutoff,
         "validation_history": history,
         "checkpoint_ranking": checkpoint_ranking,
         "config_snapshot": cfg,
@@ -922,6 +949,23 @@ def _resolve_path(path_str: str) -> Path:
     return path
 
 
+def _iter_interleaved_rows(iterables) -> object:
+    iterators = [iter(iterable) for iterable in iterables]
+    while iterators:
+        next_iterators = []
+        yielded_any = False
+        for iterator in iterators:
+            try:
+                yield next(iterator)
+                next_iterators.append(iterator)
+                yielded_any = True
+            except StopIteration:
+                continue
+        if not yielded_any:
+            break
+        iterators = next_iterators
+
+
 def _iter_audio_files(root: Path) -> list[Path]:
     exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus"}
     return [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in exts]
@@ -1069,6 +1113,19 @@ def _source_dir_state(source_dir: Path) -> dict:
 
 def _source_dirs_state(source_dirs: list[Path]) -> list[dict]:
     return [_source_dir_state(path) for path in source_dirs]
+
+
+def _staged_audio_cache_valid(
+    staged_dir: Path,
+    *,
+    file_filter: Callable[[Path], bool] | None = None,
+) -> bool:
+    staged_files = _safe_iter_audio_files(staged_dir)
+    if not staged_files:
+        return False
+    if file_filter is None:
+        return True
+    return all(file_filter(path) for path in staged_files)
 
 
 def _sanitize_group_token(value: object) -> str:
@@ -1526,10 +1583,8 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
     def load(split_name: str, streaming: bool):
         return load_dataset(repo, split=split_name, streaming=streaming, **dataset_kwargs)
 
+    split_datasets = []
     for split_name in _split_spec_parts(split):
-        if max_clips is not None and count >= max_clips:
-            break
-
         dataset = None
         try:
             dataset = load(split_name, prefer_streaming)
@@ -1537,20 +1592,27 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
             if not fallback_to_non_streaming:
                 raise
             dataset = load(split_name, False)
+        split_datasets.append(_iter_filtered_dataset(dataset, dataset_cfg))
 
-        count += _write_dataset_audio(
-            _iter_filtered_dataset(dataset, dataset_cfg),
-            output_dir,
-            prefix,
-            None if max_clips is None else max_clips - count,
-            io_workers,
-            audio_column=audio_column,
-            segment_duration_s=float(segment_duration_s) if segment_duration_s else None,
-            segment_overlap_s=segment_overlap_s,
-            min_segment_duration_s=float(min_segment_duration_s) if min_segment_duration_s else None,
-            index_entries=index_entries,
-            source_key=prefix,
-        )
+    dataset_rows = (
+        split_datasets[0]
+        if len(split_datasets) == 1
+        else _iter_interleaved_rows(split_datasets)
+    )
+
+    count += _write_dataset_audio(
+        dataset_rows,
+        output_dir,
+        prefix,
+        max_clips,
+        io_workers,
+        audio_column=audio_column,
+        segment_duration_s=float(segment_duration_s) if segment_duration_s else None,
+        segment_overlap_s=segment_overlap_s,
+        min_segment_duration_s=float(min_segment_duration_s) if min_segment_duration_s else None,
+        index_entries=index_entries,
+        source_key=prefix,
+    )
 
     count = _finalize_bootstrap_audio_count(output_dir, description=f"HF audio dataset {repo}", expected_audio_files=count)
     _write_bootstrap_index(output_dir, index_entries)
@@ -2131,7 +2193,7 @@ def _stage_audio_sources(
             current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             current_manifest = None
-        if current_manifest == source_manifest and _safe_iter_audio_files(staged_dir):
+        if current_manifest == source_manifest and _staged_audio_cache_valid(staged_dir, file_filter=file_filter):
             log.info("  Using staged %s audio at %s", label, staged_dir)
             return staged_dir
 
@@ -2171,20 +2233,65 @@ def _stage_positive_sources(cfg: dict, source_dirs: list[Path]) -> Path:
 
 
 def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
+    selection_mode = _background_source_sampling_mode(cfg)
+    selection_weights = _background_source_weights(cfg)
+    selected_files_by_source, skipped = _select_background_source_files(cfg, source_dirs)
+
     if not _background_segmentation_enabled(cfg):
-        return _stage_audio_sources(
-            staged_dir=_staged_background_dir(cfg),
-            manifest_path=_project_dir(cfg) / "staged_background_sources.json",
-            source_dirs=source_dirs,
-            label="background",
-            file_filter=_is_background_audio_usable,
-        )
+        staged_dir = _staged_background_dir(cfg)
+        manifest_path = _project_dir(cfg) / "staged_background_sources.json"
+        source_manifest = {
+            "sources": _source_dirs_state(source_dirs),
+            "background_source_sampling": selection_mode,
+            "background_source_weights": selection_weights,
+            "selected_counts": {
+                str(source_dir): len(selected_files_by_source.get(source_dir, []))
+                for source_dir in source_dirs
+            },
+        }
+
+        if staged_dir.exists() and manifest_path.exists():
+            try:
+                current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                current_manifest = None
+            if current_manifest == source_manifest and _staged_audio_cache_valid(
+                staged_dir, file_filter=_is_background_audio_usable
+            ):
+                log.info("  Using staged background audio at %s", staged_dir)
+                return staged_dir
+
+        if staged_dir.exists():
+            shutil.rmtree(staged_dir)
+        staged_dir.mkdir(parents=True, exist_ok=True)
+
+        index = 0
+        for source_dir in source_dirs:
+            for audio_file in selected_files_by_source.get(source_dir, []):
+                dest = staged_dir / f"{source_dir.name}_{index:06d}{audio_file.suffix.lower()}"
+                _link_or_copy(audio_file, dest)
+                index += 1
+
+        if index == 0:
+            raise ValueError("No background audio files were found in the configured source directories")
+
+        manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
+        log.info("  Staged %d background audio files into %s", index, staged_dir)
+        if skipped:
+            log.info("  Skipped %d unreadable background audio files during staging", skipped)
+        return staged_dir
 
     staged_dir = _staged_background_dir(cfg)
     manifest_path = _project_dir(cfg) / "staged_background_sources.json"
     seg_cfg = _background_segmentation_cfg(cfg)
     source_manifest = {
         "sources": _source_dirs_state(source_dirs),
+        "background_source_sampling": selection_mode,
+        "background_source_weights": selection_weights,
+        "selected_counts": {
+            str(source_dir): len(selected_files_by_source.get(source_dir, []))
+            for source_dir in source_dirs
+        },
         "segment_duration_s": float(seg_cfg.get("segment_duration_s", 5.0)),
         "segment_overlap_s": float(seg_cfg.get("segment_overlap_s", 2.5)),
         "min_segment_duration_s": float(seg_cfg.get("min_segment_duration_s", 4.0)),
@@ -2195,7 +2302,9 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
             current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             current_manifest = None
-        if current_manifest == source_manifest and _safe_iter_audio_files(staged_dir):
+        if current_manifest == source_manifest and _staged_audio_cache_valid(
+            staged_dir, file_filter=_is_background_audio_usable
+        ):
             log.info("  Using segmented staged background audio at %s", staged_dir)
             return staged_dir
 
@@ -2204,13 +2313,9 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
     staged_dir.mkdir(parents=True, exist_ok=True)
 
     count = 0
-    skipped = 0
     for source_dir in source_dirs:
-        for audio_file in _safe_iter_audio_files(source_dir):
+        for audio_file in selected_files_by_source.get(source_dir, []):
             try:
-                if not _is_background_audio_usable(audio_file):
-                    skipped += 1
-                    continue
                 count += _segment_file_into_dir(
                     audio_file,
                     staged_dir,
@@ -2229,7 +2334,7 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
     manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
     log.info("  Segmented %d background audio clips into %s", count, staged_dir)
     if skipped:
-        log.warning("  Skipped %d unreadable background source files during segmentation", skipped)
+        log.info("  Skipped %d unreadable background source files during segmentation", skipped)
     return staged_dir
 
 
@@ -2308,6 +2413,73 @@ def _write_preprocessed_positive_audio(src: Path, dest: Path, cfg: dict) -> None
         max_gain_db=float(pre_cfg.get("max_gain_db", 6.0)),
     )
     sf.write(str(dest), normalized, sampling_rate)
+
+
+def _background_source_sampling_mode(cfg: dict) -> str:
+    mode = str(cfg.get("background_source_sampling", "all")).strip().lower()
+    return mode if mode in {"all", "balanced", "weighted"} else "all"
+
+
+def _background_source_weights(cfg: dict) -> dict[str, float]:
+    raw = cfg.get("background_source_weights", {}) or {}
+    weights: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            weights[str(key)] = parsed
+    return weights
+
+
+def _background_source_weight_for_path(cfg: dict, source_dir: Path) -> float:
+    weights = _background_source_weights(cfg)
+    return float(weights.get(str(source_dir), weights.get(source_dir.name, 1.0)))
+
+
+def _select_background_source_files(
+    cfg: dict,
+    source_dirs: list[Path],
+) -> tuple[dict[Path, list[Path]], int]:
+    mode = _background_source_sampling_mode(cfg)
+    selected: dict[Path, list[Path]] = {}
+    skipped = 0
+
+    per_source: list[tuple[Path, list[Path], float]] = []
+    for source_dir in source_dirs:
+        usable_files: list[Path] = []
+        for audio_file in sorted(_safe_iter_audio_files(source_dir), key=lambda path: str(path)):
+            if not _is_background_audio_usable(audio_file):
+                skipped += 1
+                continue
+            usable_files.append(audio_file)
+        per_source.append((source_dir, usable_files, _background_source_weight_for_path(cfg, source_dir)))
+
+    if mode == "all":
+        for source_dir, usable_files, _ in per_source:
+            selected[source_dir] = usable_files
+        return selected, skipped
+
+    weighted_sources = [
+        (source_dir, usable_files, weight)
+        for source_dir, usable_files, weight in per_source
+        if usable_files and weight > 0
+    ]
+    if not weighted_sources:
+        for source_dir, usable_files, _ in per_source:
+            selected[source_dir] = usable_files
+        return selected, skipped
+
+    base_unit = min(len(usable_files) / weight for _, usable_files, weight in weighted_sources)
+    for source_dir, usable_files, weight in per_source:
+        if not usable_files or weight <= 0:
+            selected[source_dir] = []
+            continue
+        target_count = max(1, int(round(base_unit * weight)))
+        selected[source_dir] = usable_files[: min(len(usable_files), target_count)]
+
+    return selected, skipped
 
 
 def _segmented_positive_root(cfg: dict) -> Path:
@@ -2532,7 +2704,8 @@ def _prepare_positive_splits(cfg: dict, source_dirs: list[Path]) -> dict[str, Pa
         dest_dir = split_dirs[split_name]
         for index, record in enumerate(split_records):
             audio_file = Path(record["path"])
-            dest = dest_dir / f"{record['source_key']}_{index:06d}{audio_file.suffix.lower()}"
+            dest_suffix = ".wav" if _positive_preprocessing_enabled(cfg) else audio_file.suffix.lower()
+            dest = dest_dir / f"{record['source_key']}_{index:06d}{dest_suffix}"
             _write_preprocessed_positive_audio(audio_file, dest, cfg)
             split_counts[split_name] += 1
 
@@ -3847,6 +4020,21 @@ def step_export() -> bool:
     shutil.copy2(source, dest_model)
 
     manifest_cfg = cfg.get("esphome_manifest", {})
+    result_record = _load_latest_result_record()
+    cutoff_strategy = str(manifest_cfg.get("probability_cutoff_strategy", "fixed")).strip().lower()
+    probability_cutoff = float(manifest_cfg.get("probability_cutoff", 0.97))
+    probability_cutoff_source = "config"
+    if cutoff_strategy == "best_validation_no_faph":
+        recommended_cutoff = _recommended_probability_cutoff(result_record)
+        if recommended_cutoff is not None:
+            probability_cutoff = recommended_cutoff
+            probability_cutoff_source = "best_validation_no_faph"
+        else:
+            log.warning(
+                "  Could not resolve best-validation cutoff for export; falling back to configured probability_cutoff %.3f",
+                probability_cutoff,
+            )
+
     manifest = {
         "type": "micro",
         "wake_word": cfg.get("wake_word", cfg["model_name"]),
@@ -3856,13 +4044,14 @@ def step_export() -> bool:
         "trained_languages": manifest_cfg.get("trained_languages", ["en"]),
         "version": 2,
         "micro": {
-            "probability_cutoff": float(manifest_cfg.get("probability_cutoff", 0.97)),
+            "probability_cutoff": probability_cutoff,
             "feature_step_size": int(manifest_cfg.get("feature_step_size", 10)),
             "sliding_window_size": int(manifest_cfg.get("sliding_window_size", 5)),
             "tensor_arena_size": int(manifest_cfg.get("tensor_arena_size", 26080)),
             "minimum_esphome_version": manifest_cfg.get("minimum_esphome_version", "2024.7.0"),
         },
     }
+    manifest["micro"]["probability_cutoff_source"] = probability_cutoff_source
     dest_manifest = EXPORT_DIR / f"{cfg['model_name']}.json"
     dest_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     _write_results_indexes()
