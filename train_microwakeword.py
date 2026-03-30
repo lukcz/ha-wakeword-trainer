@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import tarfile
 import csv
 import faulthandler
@@ -34,9 +35,9 @@ import yaml
 
 # Keep TensorFlow/absl import noise out of the normal training logs unless the
 # user explicitly overrides these environment variables.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("GLOG_minloglevel", "2")
-os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
 
 # audiomentations/librosa still trigger this deprecation warning through
 # pkg_resources on some environments; it is not actionable for preset tuning.
@@ -154,6 +155,13 @@ def _setup_session_logging(config_path: Path) -> Path:
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     log.info("$ %s", " ".join(cmd))
     subprocess.check_call(cmd, cwd=str(cwd) if cwd else None, env=env)
+
+
+@contextlib.contextmanager
+def _suppress_stderr_noise():
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        with contextlib.redirect_stderr(devnull):
+            yield
 
 
 def _run_with_live_output(
@@ -1219,8 +1227,8 @@ def _build_training_env(cfg: dict, force_device: str | None = None) -> tuple[dic
     runtime = _runtime_cfg(cfg)
     env = os.environ.copy()
     env.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    env.setdefault("GLOG_minloglevel", "2")
-    env.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+    env.setdefault("GLOG_minloglevel", "3")
+    env.setdefault("ABSL_MIN_LOG_LEVEL", "3")
 
     device = str(force_device or runtime.get("device", "auto")).strip().lower()
     if device not in {"auto", "gpu", "cpu"}:
@@ -1251,8 +1259,9 @@ def _build_training_env(cfg: dict, force_device: str | None = None) -> tuple[dic
 
 def _check_micro_wake_word_import() -> bool:
     try:
-        import microwakeword  # noqa: F401
-        import mmap_ninja  # noqa: F401
+        with _suppress_stderr_noise():
+            import microwakeword  # noqa: F401
+            import mmap_ninja  # noqa: F401
         return True
     except Exception as exc:
         log.error("  microWakeWord dependencies are not installed: %s", exc)
@@ -2248,6 +2257,59 @@ def _positive_segmentation_enabled(cfg: dict) -> bool:
     return _task(cfg) == "vad" and bool(_positive_segmentation_cfg(cfg).get("enabled", False))
 
 
+def _positive_preprocessing_cfg(cfg: dict) -> dict:
+    return cfg.get("positive_preprocessing", {}) or {}
+
+
+def _positive_preprocessing_enabled(cfg: dict) -> bool:
+    pre_cfg = _positive_preprocessing_cfg(cfg)
+    return bool(pre_cfg.get("enabled", False) or pre_cfg.get("normalize_peak_dbfs") is not None)
+
+
+def _normalize_audio_peak_lite(
+    samples,
+    *,
+    target_peak_dbfs: float,
+    min_gain_db: float,
+    max_gain_db: float,
+):
+    import numpy as np
+
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if peak <= 0.0:
+        return samples
+
+    target_peak = float(10 ** (target_peak_dbfs / 20.0))
+    if target_peak <= 0.0:
+        return samples
+
+    gain_db = 20.0 * np.log10(target_peak / peak)
+    gain_db = min(max(gain_db, float(min_gain_db)), float(max_gain_db))
+    scale = float(10 ** (gain_db / 20.0))
+    output = np.asarray(samples, dtype="float32") * scale
+    return np.clip(output, -1.0, 1.0)
+
+
+def _write_preprocessed_positive_audio(src: Path, dest: Path, cfg: dict) -> None:
+    pre_cfg = _positive_preprocessing_cfg(cfg)
+    if not _positive_preprocessing_enabled(cfg):
+        _link_or_copy(src, dest)
+        return
+
+    import numpy as np
+    import soundfile as sf
+
+    samples, sampling_rate = sf.read(str(src), dtype="float32")
+    samples = np.asarray(samples, dtype="float32")
+    normalized = _normalize_audio_peak_lite(
+        samples,
+        target_peak_dbfs=float(pre_cfg.get("normalize_peak_dbfs", -3.0)),
+        min_gain_db=float(pre_cfg.get("min_gain_db", -6.0)),
+        max_gain_db=float(pre_cfg.get("max_gain_db", 6.0)),
+    )
+    sf.write(str(dest), normalized, sampling_rate)
+
+
 def _segmented_positive_root(cfg: dict) -> Path:
     return _project_dir(cfg) / "segmented_positive_audio"
 
@@ -2437,6 +2499,7 @@ def _prepare_positive_splits(cfg: dict, source_dirs: list[Path]) -> dict[str, Pa
         "split_count": float(cfg.get("split_count", 0.1)),
         "random_split_seed": int(cfg.get("random_split_seed", 10)),
         "strategy": "grouped_by_source",
+        "positive_preprocessing": _positive_preprocessing_cfg(cfg),
     }
 
     if all(_dir_has_entries(path) for path in split_dirs.values()) and manifest_path.exists():
@@ -2470,7 +2533,7 @@ def _prepare_positive_splits(cfg: dict, source_dirs: list[Path]) -> dict[str, Pa
         for index, record in enumerate(split_records):
             audio_file = Path(record["path"])
             dest = dest_dir / f"{record['source_key']}_{index:06d}{audio_file.suffix.lower()}"
-            _link_or_copy(audio_file, dest)
+            _write_preprocessed_positive_audio(audio_file, dest, cfg)
             split_counts[split_name] += 1
 
     manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
@@ -3040,6 +3103,10 @@ def _build_positive_augmenter(cfg: dict, background_paths: list[str], *, eval_mo
         background_paths=runtime_background_paths,
         background_min_snr_db=background_min_snr_db,
         background_max_snr_db=background_max_snr_db,
+        min_gain_db=float(aug_cfg.get("gain_min_db", -45.0)),
+        max_gain_db=float(aug_cfg.get("gain_max_db", 0.0)),
+        min_gain_transition_db=float(aug_cfg.get("gain_transition_min_db", -10.0)),
+        max_gain_transition_db=float(aug_cfg.get("gain_transition_max_db", 10.0)),
         min_jitter_s=min_jitter_s,
         max_jitter_s=max_jitter_s,
     )
@@ -3054,6 +3121,10 @@ def _positive_feature_manifest(cfg: dict, split_dirs: dict[str, Path], backgroun
         "augmentation_probabilities": _resolve_augmentation_probabilities(aug_cfg.get("probabilities", {})),
         "background_min_snr_db": int(aug_cfg.get("background_min_snr_db", -5)),
         "background_max_snr_db": int(aug_cfg.get("background_max_snr_db", 10)),
+        "gain_min_db": float(aug_cfg.get("gain_min_db", -45.0)),
+        "gain_max_db": float(aug_cfg.get("gain_max_db", 0.0)),
+        "gain_transition_min_db": float(aug_cfg.get("gain_transition_min_db", -10.0)),
+        "gain_transition_max_db": float(aug_cfg.get("gain_transition_max_db", 10.0)),
         "min_jitter_s": float(aug_cfg.get("min_jitter_s", 0.195)),
         "max_jitter_s": float(aug_cfg.get("max_jitter_s", 0.205)),
         "apply_to_eval": bool(aug_cfg.get("apply_to_eval", False)),
