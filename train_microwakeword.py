@@ -26,7 +26,7 @@ import warnings
 import zipfile
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from posixpath import normpath as posix_normpath
 from typing import Callable
 
