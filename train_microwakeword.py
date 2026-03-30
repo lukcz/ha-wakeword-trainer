@@ -623,6 +623,18 @@ def _write_bootstrap_manifest(path: Path, *, description: str, expected_audio_fi
     _bootstrap_manifest_path(path).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
+def _finalize_bootstrap_audio_count(path: Path, *, description: str, expected_audio_files: int) -> int:
+    actual_audio_files = _audio_file_count(path)
+    if actual_audio_files != int(expected_audio_files):
+        log.warning(
+            "  %s produced %d files on disk, while the bootstrap pass counted %d items. Using the on-disk count for the manifest.",
+            description,
+            actual_audio_files,
+            int(expected_audio_files),
+        )
+    return actual_audio_files
+
+
 def _bootstrap_audio_dir_verified(path: Path, *, description: str) -> bool:
     if not path.exists():
         return False
@@ -1029,6 +1041,7 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
             min_segment_duration_s=float(min_segment_duration_s) if min_segment_duration_s else None,
         )
 
+    count = _finalize_bootstrap_audio_count(output_dir, description=f"HF audio dataset {repo}", expected_audio_files=count)
     _write_bootstrap_manifest(
         output_dir,
         description=f"HF audio dataset {repo}",
@@ -1099,6 +1112,7 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
     dataset_root = _find_common_voice_dataset_root(extract_dir)
     _reset_dir(output_dir)
     count = _copy_common_voice_audio_subset(dataset_root, output_dir, prefix=prefix, max_clips=max_clips)
+    count = _finalize_bootstrap_audio_count(output_dir, description="Common Voice dataset", expected_audio_files=count)
     _write_bootstrap_manifest(
         output_dir,
         description="Common Voice dataset",
@@ -1341,6 +1355,7 @@ def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
         shutil.copy2(audio_file, dest)
         count += 1
 
+    count = _finalize_bootstrap_audio_count(output_dir, description="MLS Polish dataset", expected_audio_files=count)
     _write_bootstrap_manifest(
         output_dir,
         description="MLS Polish dataset",
@@ -1374,6 +1389,7 @@ def _download_sounds_of_home_dataset(dataset_cfg: dict) -> None:
     )
 
     file_count = len(_safe_iter_audio_files(output_dir))
+    file_count = _finalize_bootstrap_audio_count(output_dir, description="Sounds of Home dataset", expected_audio_files=file_count)
     _write_bootstrap_manifest(
         output_dir,
         description="Sounds of Home dataset",
@@ -1412,6 +1428,7 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
             trust_remote_code=True,
         )
     count = _write_dataset_audio(dataset, output_dir, "bigos", max_clips, io_workers)
+    count = _finalize_bootstrap_audio_count(output_dir, description="BIGOS dataset", expected_audio_files=count)
     _write_bootstrap_manifest(
         output_dir,
         description="BIGOS dataset",
@@ -1897,6 +1914,7 @@ def _download_mit_rirs(dest: Path, io_workers: int = 4) -> None:
         trust_remote_code=True,
     )
     count = _write_dataset_audio(dataset, dest, "rir", None, io_workers)
+    count = _finalize_bootstrap_audio_count(dest, description="MIT RIR dataset", expected_audio_files=count)
     _write_bootstrap_manifest(dest, description="MIT RIR dataset", expected_audio_files=count)
     log.info("  Saved %d RIR files", count)
 
@@ -1935,6 +1953,7 @@ def _download_musan_openslr(dest: Path) -> None:
             shutil.copy2(audio_file, target)
             copied += 1
 
+    copied = _finalize_bootstrap_audio_count(dest, description="MUSAN music/noise dataset", expected_audio_files=copied)
     _write_bootstrap_manifest(dest, description="MUSAN music/noise dataset", expected_audio_files=copied)
     shutil.rmtree(extract_dir, ignore_errors=True)
     log.info("  Prepared %d MUSAN music/noise files in %s", copied, dest)
@@ -1955,6 +1974,7 @@ def _download_audioset_subset(dest: Path, limit: int | None = 300, io_workers: i
         trust_remote_code=True,
     )
     count = _write_dataset_audio(dataset, dest, "audioset", limit, io_workers)
+    count = _finalize_bootstrap_audio_count(dest, description="AudioSet subset", expected_audio_files=count)
     _write_bootstrap_manifest(dest, description="AudioSet subset", expected_audio_files=count, metadata={"limit": limit})
     log.info("  Saved %d AudioSet clips", count)
 
@@ -1989,6 +2009,7 @@ def _download_fma_subset(dest: Path, limit: int | None = 200, io_workers: int = 
         )
         count = _write_dataset_audio(dataset, dest, "fma", limit, io_workers)
 
+    count = _finalize_bootstrap_audio_count(dest, description="FMA subset", expected_audio_files=count)
     _write_bootstrap_manifest(dest, description="FMA subset", expected_audio_files=count, metadata={"limit": limit})
     log.info("  Saved %d FMA clips", count)
 
