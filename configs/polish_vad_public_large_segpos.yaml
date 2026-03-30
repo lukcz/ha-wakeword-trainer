@@ -33,6 +33,7 @@ bootstrap_speech_datasets:
     split: "train+validation"
     max_clips: 3000
 
+include_default_background_subsets: true
 background_audio_paths:
   - "data/audioset_nonspeech"
   - "data/wham_noise"

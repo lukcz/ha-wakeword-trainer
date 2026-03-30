@@ -22,6 +22,7 @@ import sys
 import textwrap
 import time
 import zipfile
+from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from posixpath import normpath as posix_normpath
@@ -38,12 +39,14 @@ DATA_DIR = SCRIPT_DIR / "data"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 EXPORT_DIR = SCRIPT_DIR / "export"
 LOGS_DIR = OUTPUT_DIR / "_logs"
+RESULTS_DIR = OUTPUT_DIR / "_results"
 DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "microwakeword_example.yaml"
 TENSORBOARD_PIP_SPEC = "tensorboard>=2.20.0,<2.21.0"
 MDC_PIP_SPEC = "datacollective>=0.4.5"
 ZIPFILE_INFLATE64_PIP_SPEC = "zipfile-inflate64>=0.1"
 COMMON_VOICE_MDC_ORG_URL = "https://datacollective.mozillafoundation.org/organization/cmfh0j9o10006ns07jq45h7xk"
 BOOTSTRAP_MANIFEST_NAME = ".bootstrap_manifest.json"
+BOOTSTRAP_INDEX_NAME = ".bootstrap_index.jsonl"
 
 CONFIG_FILE = DEFAULT_CONFIG
 
@@ -61,10 +64,11 @@ logging.basicConfig(
 log = logging.getLogger("train_microwakeword")
 _SESSION_LOG_FILE: io.TextIOWrapper | None = None
 _SESSION_CRASH_LOG_FILE: io.TextIOWrapper | None = None
+_SESSION_LOG_PATH: Path | None = None
 
 
 def _close_session_log_files() -> None:
-    global _SESSION_LOG_FILE, _SESSION_CRASH_LOG_FILE
+    global _SESSION_LOG_FILE, _SESSION_CRASH_LOG_FILE, _SESSION_LOG_PATH
 
     for handle_name in ("_SESSION_LOG_FILE", "_SESSION_CRASH_LOG_FILE"):
         handle = globals().get(handle_name)
@@ -76,13 +80,14 @@ def _close_session_log_files() -> None:
         except OSError:
             pass
         globals()[handle_name] = None
+    _SESSION_LOG_PATH = None
 
 
 atexit.register(_close_session_log_files)
 
 
 def _setup_session_logging(config_path: Path) -> Path:
-    global _SESSION_LOG_FILE, _SESSION_CRASH_LOG_FILE
+    global _SESSION_LOG_FILE, _SESSION_CRASH_LOG_FILE, _SESSION_LOG_PATH
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -111,6 +116,7 @@ def _setup_session_logging(config_path: Path) -> Path:
 
     _SESSION_CRASH_LOG_FILE = open(crash_log_path, "a", encoding="utf-8", buffering=1)
     faulthandler.enable(file=_SESSION_CRASH_LOG_FILE, all_threads=True)
+    _SESSION_LOG_PATH = session_log_path
 
     return session_log_path
 
@@ -118,6 +124,38 @@ def _setup_session_logging(config_path: Path) -> Path:
 def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     log.info("$ %s", " ".join(cmd))
     subprocess.check_call(cmd, cwd=str(cwd) if cwd else None, env=env)
+
+
+def _run_with_live_output(
+    cmd: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, list[str]]:
+    log.info("$ %s", " ".join(cmd))
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    captured_lines: list[str] = []
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        captured_lines.append(raw_line.rstrip("\r\n"))
+        sys.stdout.write(raw_line)
+        sys.stdout.flush()
+        if _SESSION_LOG_FILE is not None:
+            _SESSION_LOG_FILE.write(raw_line)
+            _SESSION_LOG_FILE.flush()
+
+    process.stdout.close()
+    return process.wait(), captured_lines
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -139,6 +177,107 @@ def _format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes:d}m {secs:02d}s"
     return f"{secs:d}s"
+
+
+def _results_file_paths(config_path: Path) -> tuple[Path, Path]:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    latest_path = RESULTS_DIR / f"{config_path.stem}.json"
+    history_path = RESULTS_DIR / f"{config_path.stem}.jsonl"
+    return latest_path, history_path
+
+
+def _config_sha1(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def _extract_training_validation_history(lines: list[str]) -> list[dict]:
+    validation_re = re.compile(
+        r"Step (?P<step>\d+) \(nonstreaming\): Validation: "
+        r"recall at no faph = (?P<recall_at_no_faph>[-0-9.]+) "
+        r"with cutoff (?P<cutoff>[-0-9.]+), "
+        r"accuracy = (?P<accuracy>[-0-9.]+)%, "
+        r"recall = (?P<recall>[-0-9.]+)%, "
+        r"precision = (?P<precision>[-0-9.]+)%, "
+        r"ambient false positives = (?P<ambient_false_positives>\d+), "
+        r"estimated false positives per hour = (?P<estimated_false_positives_per_hour>[-0-9.]+), "
+        r"loss = (?P<loss>[-0-9.]+), "
+        r"auc = (?P<auc>[-0-9.]+), "
+        r"average viable recall = (?P<average_viable_recall>[-0-9.]+)"
+    )
+
+    history: list[dict] = []
+    for line in lines:
+        match = validation_re.search(line)
+        if not match:
+            continue
+        values = match.groupdict()
+        history.append(
+            {
+                "step": int(values["step"]),
+                "recall_at_no_faph": float(values["recall_at_no_faph"]),
+                "cutoff": float(values["cutoff"]),
+                "accuracy": float(values["accuracy"]),
+                "recall": float(values["recall"]),
+                "precision": float(values["precision"]),
+                "ambient_false_positives": int(values["ambient_false_positives"]),
+                "estimated_false_positives_per_hour": float(values["estimated_false_positives_per_hour"]),
+                "loss": float(values["loss"]),
+                "auc": float(values["auc"]),
+                "average_viable_recall": float(values["average_viable_recall"]),
+            }
+        )
+
+    return history
+
+
+def _write_training_result_summary(
+    cfg: dict,
+    *,
+    training_config_path: Path,
+    status: str,
+    attempts: list[dict],
+    error: str | None = None,
+) -> Path:
+    latest_path, history_path = _results_file_paths(CONFIG_FILE)
+    history = _extract_training_validation_history(
+        next(
+            (attempt.get("captured_lines", []) for attempt in reversed(attempts) if attempt.get("captured_lines")),
+            [],
+        )
+    )
+    best_validation = max(history, key=lambda item: item["average_viable_recall"], default=None)
+    latest_validation = history[-1] if history else None
+
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "preset": CONFIG_FILE.stem,
+        "config_file": str(CONFIG_FILE),
+        "config_sha1": _config_sha1(CONFIG_FILE),
+        "model_name": cfg.get("model_name"),
+        "status": status,
+        "error": error,
+        "training_config": str(training_config_path),
+        "training_dir": str(_training_dir(cfg)),
+        "session_log": str(_SESSION_LOG_PATH) if _SESSION_LOG_PATH else None,
+        "attempts": [
+            {
+                "device": attempt.get("device"),
+                "returncode": int(attempt.get("returncode", 0)),
+                "line_count": len(attempt.get("captured_lines", [])),
+            }
+            for attempt in attempts
+        ],
+        "best_validation": best_validation,
+        "latest_validation": latest_validation,
+        "validation_history": history,
+        "config_snapshot": cfg,
+    }
+
+    latest_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    with open(history_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    log.info("  Saved training result summary to %s", latest_path)
+    return latest_path
 
 
 def _supports_inline_progress() -> bool:
@@ -613,6 +752,10 @@ def _bootstrap_manifest_path(path: Path) -> Path:
     return path / BOOTSTRAP_MANIFEST_NAME
 
 
+def _bootstrap_index_path(path: Path) -> Path:
+    return path / BOOTSTRAP_INDEX_NAME
+
+
 def _write_bootstrap_manifest(path: Path, *, description: str, expected_audio_files: int, metadata: dict | None = None) -> None:
     manifest = {
         "description": description,
@@ -633,6 +776,151 @@ def _finalize_bootstrap_audio_count(path: Path, *, description: str, expected_au
             int(expected_audio_files),
         )
     return actual_audio_files
+
+
+def _write_bootstrap_index(path: Path, entries: list[dict] | None) -> None:
+    index_path = _bootstrap_index_path(path)
+    if not entries:
+        if index_path.exists():
+            index_path.unlink()
+        return
+
+    filtered_entries = []
+    seen_files: set[str] = set()
+    for entry in entries:
+        file_name = str(entry.get("file_name", "")).strip()
+        if not file_name or file_name in seen_files:
+            continue
+        if not (path / file_name).exists():
+            continue
+        filtered_entries.append(entry)
+        seen_files.add(file_name)
+
+    if not filtered_entries:
+        if index_path.exists():
+            index_path.unlink()
+        return
+
+    with open(index_path, "w", encoding="utf-8") as handle:
+        for entry in filtered_entries:
+            handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+
+def _load_bootstrap_index(path: Path) -> dict[str, dict]:
+    index_path = _bootstrap_index_path(path)
+    if not index_path.exists():
+        return {}
+
+    entries: dict[str, dict] = {}
+    try:
+        with open(index_path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if not isinstance(entry, dict):
+                    continue
+                file_name = str(entry.get("file_name", "")).strip()
+                if file_name:
+                    entries[file_name] = entry
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return entries
+
+
+def _source_dir_state(source_dir: Path) -> dict:
+    files = _safe_iter_audio_files(source_dir)
+    total_bytes = 0
+    latest_mtime_ns = 0
+    for audio_file in files:
+        try:
+            stat = audio_file.stat()
+        except OSError:
+            continue
+        total_bytes += int(stat.st_size)
+        latest_mtime_ns = max(latest_mtime_ns, int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))))
+
+    manifest_hash = None
+    manifest_path = _bootstrap_manifest_path(source_dir)
+    if manifest_path.exists():
+        try:
+            manifest_hash = hashlib.sha1(manifest_path.read_bytes()).hexdigest()
+        except OSError:
+            manifest_hash = None
+
+    index_hash = None
+    index_path = _bootstrap_index_path(source_dir)
+    if index_path.exists():
+        try:
+            index_hash = hashlib.sha1(index_path.read_bytes()).hexdigest()
+        except OSError:
+            index_hash = None
+
+    return {
+        "path": str(source_dir),
+        "audio_files": len(files),
+        "total_bytes": total_bytes,
+        "latest_mtime_ns": latest_mtime_ns,
+        "bootstrap_manifest_sha1": manifest_hash,
+        "bootstrap_index_sha1": index_hash,
+    }
+
+
+def _source_dirs_state(source_dirs: list[Path]) -> list[dict]:
+    return [_source_dir_state(path) for path in source_dirs]
+
+
+def _sanitize_group_token(value: object) -> str:
+    token = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value).strip())
+    return token.strip("._-") or "unknown"
+
+
+def _extract_audio_source_path_from_row(row: dict, audio_column: str) -> str | None:
+    audio = row.get(audio_column)
+    if isinstance(audio, dict):
+        for key in ("path", "filename"):
+            value = audio.get(key)
+            if value:
+                return str(value)
+    for key in ("path", "filename", "file", "audio_filepath"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _extract_row_group_key(row: dict, *, audio_column: str, fallback: str) -> str:
+    for key in (
+        "speaker_id",
+        "speaker",
+        "client_id",
+        "client",
+        "speaker_name",
+        "voice",
+        "session_id",
+        "recording_id",
+        "chapter_id",
+        "speaker_idx",
+    ):
+        value = row.get(key)
+        if value not in (None, ""):
+            return _sanitize_group_token(value)
+
+    source_path = _extract_audio_source_path_from_row(row, audio_column)
+    if source_path:
+        source_name = Path(source_path)
+        if len(source_name.parts) > 1:
+            return _sanitize_group_token(source_name.parts[-2])
+        return _sanitize_group_token(source_name.stem)
+
+    for key in ("id", "segment_id", "utterance_id", "sentence_id"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return _sanitize_group_token(value)
+
+    return _sanitize_group_token(fallback)
 
 
 def _bootstrap_audio_dir_verified(path: Path, *, description: str) -> bool:
@@ -886,6 +1174,8 @@ def _write_dataset_audio(
     segment_duration_s: float | None = None,
     segment_overlap_s: float = 0.0,
     min_segment_duration_s: float | None = None,
+    index_entries: list[dict] | None = None,
+    source_key: str | None = None,
 ) -> int:
     import numpy as np
 
@@ -902,6 +1192,12 @@ def _write_dataset_audio(
             except Exception:
                 continue
 
+            row_group_key = _extract_row_group_key(
+                row,
+                audio_column=audio_column,
+                fallback=f"{source_key or prefix}_{count:06d}",
+            )
+
             for chunk in _segment_audio_samples(
                 samples,
                 sampling_rate,
@@ -912,8 +1208,17 @@ def _write_dataset_audio(
                 if max_clips is not None and count >= max_clips:
                     break
 
-                dest = output_dir / f"{prefix}_{count:06d}.wav"
+                file_name = f"{prefix}_{count:06d}.wav"
+                dest = output_dir / file_name
                 futures.add(executor.submit(_write_audio_file, dest, chunk, sampling_rate))
+                if index_entries is not None:
+                    index_entries.append(
+                        {
+                            "file_name": file_name,
+                            "source_key": str(source_key or prefix),
+                            "group_key": row_group_key,
+                        }
+                    )
                 count += 1
 
             if len(futures) >= io_workers * 4:
@@ -1008,6 +1313,7 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
 
     _reset_dir(output_dir)
     count = 0
+    index_entries: list[dict] = []
     dataset_kwargs = {}
     if hf_config is not None and str(hf_config).strip():
         dataset_kwargs["name"] = str(hf_config)
@@ -1039,9 +1345,12 @@ def _download_hf_audio_dataset(dataset_cfg: dict) -> None:
             segment_duration_s=float(segment_duration_s) if segment_duration_s else None,
             segment_overlap_s=segment_overlap_s,
             min_segment_duration_s=float(min_segment_duration_s) if min_segment_duration_s else None,
+            index_entries=index_entries,
+            source_key=prefix,
         )
 
     count = _finalize_bootstrap_audio_count(output_dir, description=f"HF audio dataset {repo}", expected_audio_files=count)
+    _write_bootstrap_index(output_dir, index_entries)
     _write_bootstrap_manifest(
         output_dir,
         description=f"HF audio dataset {repo}",
@@ -1111,8 +1420,9 @@ def _download_common_voice_dataset(dataset_cfg: dict) -> None:
     _extract_archive(Path(archive_path), extract_dir, description=f"Common Voice {version} ({locale}) archive")
     dataset_root = _find_common_voice_dataset_root(extract_dir)
     _reset_dir(output_dir)
-    count = _copy_common_voice_audio_subset(dataset_root, output_dir, prefix=prefix, max_clips=max_clips)
+    count, index_entries = _copy_common_voice_audio_subset(dataset_root, output_dir, prefix=prefix, max_clips=max_clips)
     count = _finalize_bootstrap_audio_count(output_dir, description="Common Voice dataset", expected_audio_files=count)
+    _write_bootstrap_index(output_dir, index_entries)
     _write_bootstrap_manifest(
         output_dir,
         description="Common Voice dataset",
@@ -1246,41 +1556,80 @@ def _find_common_voice_dataset_root(extract_dir: Path) -> Path:
     return candidates[0]
 
 
-def _iter_common_voice_relative_paths(dataset_root: Path) -> list[str]:
+def _iter_common_voice_entries(dataset_root: Path) -> list[dict]:
     validated_tsv = dataset_root / "validated.tsv"
     if validated_tsv.exists():
         with open(validated_tsv, encoding="utf-8") as handle:
             reader = csv.DictReader(handle, delimiter="\t")
             if reader.fieldnames and "path" in reader.fieldnames:
-                return [str(row["path"]).strip() for row in reader if str(row.get("path", "")).strip()]
+                entries = []
+                for row in reader:
+                    relative_path = str(row.get("path", "")).strip()
+                    if not relative_path:
+                        continue
+                    entries.append(
+                        {
+                            "relative_path": relative_path,
+                            "group_key": _sanitize_group_token(
+                                row.get("client_id")
+                                or row.get("speaker_id")
+                                or Path(relative_path).stem
+                            ),
+                        }
+                    )
+                return entries
 
     clips_root = dataset_root / "clips"
-    return [path.name for path in sorted(_safe_iter_audio_files(clips_root))]
+    return [
+        {
+            "relative_path": path.name,
+            "group_key": _sanitize_group_token(path.stem),
+        }
+        for path in sorted(_safe_iter_audio_files(clips_root))
+    ]
 
 
-def _copy_common_voice_audio_subset(dataset_root: Path, output_dir: Path, *, prefix: str, max_clips: int | None) -> int:
+def _copy_common_voice_audio_subset(
+    dataset_root: Path,
+    output_dir: Path,
+    *,
+    prefix: str,
+    max_clips: int | None,
+) -> tuple[int, list[dict]]:
     clips_root = dataset_root / "clips"
     if not clips_root.exists():
         raise FileNotFoundError(f"Expected Common Voice clips directory not found: {clips_root}")
 
     count = 0
     seen_paths: set[Path] = set()
-    for relative_path in _iter_common_voice_relative_paths(dataset_root):
+    index_entries: list[dict] = []
+    for entry in _iter_common_voice_entries(dataset_root):
         if max_clips is not None and count >= max_clips:
             break
+        relative_path = str(entry.get("relative_path", "")).strip()
+        if not relative_path:
+            continue
         source = clips_root / relative_path
         if not source.exists() or source in seen_paths:
             continue
         suffix = source.suffix.lower() or ".mp3"
-        dest = output_dir / f"{prefix}_{count:06d}{suffix}"
+        file_name = f"{prefix}_{count:06d}{suffix}"
+        dest = output_dir / file_name
         shutil.copy2(source, dest)
         seen_paths.add(source)
+        index_entries.append(
+            {
+                "file_name": file_name,
+                "source_key": prefix,
+                "group_key": _sanitize_group_token(entry.get("group_key", Path(relative_path).stem)),
+            }
+        )
         count += 1
 
     if count == 0:
         raise RuntimeError(f"No Common Voice audio clips were copied from {dataset_root}")
 
-    return count
+    return count, index_entries
 
 
 def _download_voxpopuli_dataset(dataset_cfg: dict) -> None:
@@ -1348,14 +1697,29 @@ def _download_mls_polish_dataset(dataset_cfg: dict) -> None:
 
     _reset_dir(output_dir)
     count = 0
+    index_entries: list[dict] = []
     for audio_file in _safe_iter_audio_files(audio_root):
         if max_clips is not None and count >= max_clips:
             break
-        dest = output_dir / f"mls_polish_{count:06d}{audio_file.suffix.lower()}"
+        file_name = f"mls_polish_{count:06d}{audio_file.suffix.lower()}"
+        dest = output_dir / file_name
         shutil.copy2(audio_file, dest)
+        relative = audio_file.relative_to(audio_root)
+        if len(relative.parts) > 1:
+            group_key = relative.parts[0]
+        else:
+            group_key = audio_file.stem
+        index_entries.append(
+            {
+                "file_name": file_name,
+                "source_key": "mls_polish",
+                "group_key": _sanitize_group_token(group_key),
+            }
+        )
         count += 1
 
     count = _finalize_bootstrap_audio_count(output_dir, description="MLS Polish dataset", expected_audio_files=count)
+    _write_bootstrap_index(output_dir, index_entries)
     _write_bootstrap_manifest(
         output_dir,
         description="MLS Polish dataset",
@@ -1427,8 +1791,18 @@ def _download_bigos_dataset(dataset_cfg: dict) -> None:
             streaming=False,
             trust_remote_code=True,
         )
-    count = _write_dataset_audio(dataset, output_dir, "bigos", max_clips, io_workers)
+    index_entries: list[dict] = []
+    count = _write_dataset_audio(
+        dataset,
+        output_dir,
+        "bigos",
+        max_clips,
+        io_workers,
+        index_entries=index_entries,
+        source_key="bigos",
+    )
     count = _finalize_bootstrap_audio_count(output_dir, description="BIGOS dataset", expected_audio_files=count)
+    _write_bootstrap_index(output_dir, index_entries)
     _write_bootstrap_manifest(
         output_dir,
         description="BIGOS dataset",
@@ -1547,7 +1921,7 @@ def _stage_audio_sources(
     label: str,
     file_filter: Callable[[Path], bool] | None = None,
 ) -> Path:
-    source_manifest = [str(path) for path in source_dirs]
+    source_manifest = _source_dirs_state(source_dirs)
 
     if staged_dir.exists() and manifest_path.exists():
         try:
@@ -1607,7 +1981,7 @@ def _stage_background_sources(cfg: dict, source_dirs: list[Path]) -> Path:
     manifest_path = _project_dir(cfg) / "staged_background_sources.json"
     seg_cfg = _background_segmentation_cfg(cfg)
     source_manifest = {
-        "sources": [str(path) for path in source_dirs],
+        "sources": _source_dirs_state(source_dirs),
         "segment_duration_s": float(seg_cfg.get("segment_duration_s", 5.0)),
         "segment_overlap_s": float(seg_cfg.get("segment_overlap_s", 2.5)),
         "min_segment_duration_s": float(seg_cfg.get("min_segment_duration_s", 4.0)),
@@ -1668,6 +2042,10 @@ def _generated_background_negative_manifest_path(cfg: dict) -> Path:
     return _project_dir(cfg) / "generated_background_negative_features.json"
 
 
+def _positive_feature_manifest_path(cfg: dict) -> Path:
+    return _project_dir(cfg) / "generated_positive_features.json"
+
+
 def _positive_segmentation_cfg(cfg: dict) -> dict:
     return cfg.get("positive_segmentation", {}) or {}
 
@@ -1682,6 +2060,23 @@ def _segmented_positive_root(cfg: dict) -> Path:
 
 def _segmented_positive_manifest_path(cfg: dict) -> Path:
     return _project_dir(cfg) / "segmented_positive_audio.json"
+
+
+def _split_positive_root(cfg: dict) -> Path:
+    return _project_dir(cfg) / "split_positive_audio"
+
+
+def _split_positive_manifest_path(cfg: dict) -> Path:
+    return _project_dir(cfg) / "split_positive_audio.json"
+
+
+def _split_positive_dirs(cfg: dict) -> dict[str, Path]:
+    root = _split_positive_root(cfg)
+    return {
+        "train": root / "training",
+        "validation": root / "validation",
+        "test": root / "testing",
+    }
 
 
 def _background_segmentation_cfg(cfg: dict) -> dict:
@@ -1749,22 +2144,86 @@ def _segment_file_into_dir(
     return count
 
 
-def _split_source_files(files: list[Path], split_count: float, seed: int) -> dict[str, list[Path]]:
-    shuffled = sorted(files, key=lambda path: str(path))
-    rng = random.Random(seed)
-    rng.shuffle(shuffled)
+def _infer_positive_group_key(source_dir: Path, audio_file: Path) -> str:
+    try:
+        relative = audio_file.relative_to(source_dir)
+    except ValueError:
+        relative = Path(audio_file.name)
 
-    total = len(shuffled)
-    holdout = int(round(total * split_count))
-    validation_count = min(holdout, total)
-    test_count = min(holdout, max(0, total - validation_count))
-    train_count = max(0, total - validation_count - test_count)
+    if len(relative.parts) > 1:
+        return _sanitize_group_token(relative.parts[0])
+    return _sanitize_group_token(audio_file.stem)
 
-    return {
-        "train": shuffled[:train_count],
-        "validation": shuffled[train_count:train_count + validation_count],
-        "test": shuffled[train_count + validation_count:train_count + validation_count + test_count],
-    }
+
+def _collect_positive_records(source_dirs: list[Path]) -> list[dict]:
+    records: list[dict] = []
+    for source_dir in source_dirs:
+        bootstrap_index = _load_bootstrap_index(source_dir)
+        for audio_file in sorted(_safe_iter_audio_files(source_dir), key=lambda path: str(path)):
+            entry = bootstrap_index.get(audio_file.name, {})
+            source_key = _sanitize_group_token(entry.get("source_key", source_dir.name))
+            group_key = entry.get("group_key") or _infer_positive_group_key(source_dir, audio_file)
+            records.append(
+                {
+                    "path": audio_file,
+                    "source_key": source_key,
+                    "group_key": f"{source_key}:{_sanitize_group_token(group_key)}",
+                }
+            )
+    return records
+
+
+def _split_positive_records(records: list[dict], split_count: float, seed: int) -> dict[str, list[dict]]:
+    splits: dict[str, list[dict]] = {"train": [], "validation": [], "test": []}
+    grouped: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for record in records:
+        grouped[str(record["source_key"])][str(record["group_key"])].append(record)
+
+    for source_key in sorted(grouped):
+        source_groups = list(grouped[source_key].items())
+        rng = random.Random(f"{seed}:{source_key}")
+        rng.shuffle(source_groups)
+
+        source_total = sum(len(items) for _, items in source_groups)
+        validation_target = min(source_total, int(round(source_total * split_count)))
+        test_target = min(max(0, source_total - validation_target), int(round(source_total * split_count)))
+        assigned_counts = {"validation": 0, "test": 0}
+        source_split_groups: dict[str, list[tuple[str, list[dict]]]] = {
+            "train": [],
+            "validation": [],
+            "test": [],
+        }
+
+        for group_key, group_records in source_groups:
+            target_split = "train"
+            if assigned_counts["validation"] < validation_target:
+                target_split = "validation"
+                assigned_counts["validation"] += len(group_records)
+            elif assigned_counts["test"] < test_target:
+                target_split = "test"
+                assigned_counts["test"] += len(group_records)
+            source_split_groups[target_split].append((group_key, group_records))
+
+        if not source_split_groups["train"]:
+            donor_split = "test" if source_split_groups["test"] else "validation"
+            if source_split_groups[donor_split]:
+                donor_index = min(
+                    range(len(source_split_groups[donor_split])),
+                    key=lambda idx: len(source_split_groups[donor_split][idx][1]),
+                )
+                source_split_groups["train"].append(source_split_groups[donor_split].pop(donor_index))
+
+        for split_name, grouped_records in source_split_groups.items():
+            for _, group_records in grouped_records:
+                splits[split_name].extend(group_records)
+
+    for split_name in splits:
+        splits[split_name] = sorted(
+            splits[split_name],
+            key=lambda record: (str(record["source_key"]), str(record["path"])),
+        )
+
+    return splits
 
 
 def _segmented_positive_split_dirs(cfg: dict) -> dict[str, Path]:
@@ -1776,18 +2235,72 @@ def _segmented_positive_split_dirs(cfg: dict) -> dict[str, Path]:
     }
 
 
+def _prepare_positive_splits(cfg: dict, source_dirs: list[Path]) -> dict[str, Path]:
+    split_dirs = _split_positive_dirs(cfg)
+    manifest_path = _split_positive_manifest_path(cfg)
+    source_manifest = {
+        "sources": _source_dirs_state(source_dirs),
+        "split_count": float(cfg.get("split_count", 0.1)),
+        "random_split_seed": int(cfg.get("random_split_seed", 10)),
+        "strategy": "grouped_by_source",
+    }
+
+    if all(_dir_has_entries(path) for path in split_dirs.values()) and manifest_path.exists():
+        try:
+            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            current_manifest = None
+        if current_manifest == source_manifest:
+            log.info("  Using grouped positive splits at %s", _split_positive_root(cfg))
+            return split_dirs
+
+    split_root = _split_positive_root(cfg)
+    if split_root.exists():
+        shutil.rmtree(split_root)
+    for directory in split_dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    records = _collect_positive_records(source_dirs)
+    if not records:
+        raise ValueError("No positive audio files were found for grouped splitting")
+
+    splits = _split_positive_records(
+        records,
+        split_count=float(cfg.get("split_count", 0.1)),
+        seed=int(cfg.get("random_split_seed", 10)),
+    )
+
+    split_counts: dict[str, int] = {"train": 0, "validation": 0, "test": 0}
+    for split_name, split_records in splits.items():
+        dest_dir = split_dirs[split_name]
+        for index, record in enumerate(split_records):
+            audio_file = Path(record["path"])
+            dest = dest_dir / f"{record['source_key']}_{index:06d}{audio_file.suffix.lower()}"
+            _link_or_copy(audio_file, dest)
+            split_counts[split_name] += 1
+
+    manifest_path.write_text(json.dumps(source_manifest, indent=2) + "\n", encoding="utf-8")
+    log.info(
+        "  Prepared grouped positive splits at %s: train=%d validation=%d test=%d",
+        split_root,
+        split_counts["train"],
+        split_counts["validation"],
+        split_counts["test"],
+    )
+    return split_dirs
+
+
 def _prepare_segmented_positive_splits(cfg: dict, source_dirs: list[Path]) -> dict[str, Path]:
     seg_cfg = _positive_segmentation_cfg(cfg)
+    split_source_dirs = _prepare_positive_splits(cfg, source_dirs)
     split_dirs = _segmented_positive_split_dirs(cfg)
     manifest_path = _segmented_positive_manifest_path(cfg)
 
     source_manifest = {
-        "sources": [str(path) for path in source_dirs],
+        "sources": _source_dirs_state(list(split_source_dirs.values())),
         "segment_duration_s": float(seg_cfg.get("segment_duration_s", 5.0)),
         "segment_overlap_s": float(seg_cfg.get("segment_overlap_s", 2.5)),
         "min_segment_duration_s": float(seg_cfg.get("min_segment_duration_s", 4.0)),
-        "split_count": float(cfg.get("split_count", 0.1)),
-        "random_split_seed": int(cfg.get("random_split_seed", 10)),
     }
 
     if all(_dir_has_entries(path) for path in split_dirs.values()) and manifest_path.exists():
@@ -1805,27 +2318,14 @@ def _prepare_segmented_positive_splits(cfg: dict, source_dirs: list[Path]) -> di
     for directory in split_dirs.values():
         directory.mkdir(parents=True, exist_ok=True)
 
-    files: list[Path] = []
-    for source_dir in source_dirs:
-        files.extend(_safe_iter_audio_files(source_dir))
-
-    if not files:
-        raise ValueError("No positive audio files were found for segmentation")
-
-    splits = _split_source_files(
-        files,
-        split_count=float(cfg.get("split_count", 0.1)),
-        seed=int(cfg.get("random_split_seed", 10)),
-    )
-
     segment_duration_s = float(seg_cfg.get("segment_duration_s", 5.0))
     segment_overlap_s = float(seg_cfg.get("segment_overlap_s", 2.5))
     min_segment_duration_s = float(seg_cfg.get("min_segment_duration_s", 4.0))
 
     segment_counts: dict[str, int] = {"train": 0, "validation": 0, "test": 0}
-    for split_name, split_files in splits.items():
+    for split_name, source_dir in split_source_dirs.items():
         dest_dir = split_dirs[split_name]
-        for index, audio_file in enumerate(split_files):
+        for index, audio_file in enumerate(_safe_iter_audio_files(source_dir)):
             segment_counts[split_name] += _segment_file_into_dir(
                 audio_file,
                 dest_dir,
@@ -1906,15 +2406,25 @@ def _download_mit_rirs(dest: Path, io_workers: int = 4) -> None:
     if _bootstrap_audio_dir_verified(dest, description="MIT RIR dataset"):
         return
 
-    dest.mkdir(parents=True, exist_ok=True)
+    _reset_dir(dest)
     dataset = load_dataset(
         "davidscripka/MIT_environmental_impulse_responses",
         split="train",
         streaming=True,
         trust_remote_code=True,
     )
-    count = _write_dataset_audio(dataset, dest, "rir", None, io_workers)
+    index_entries: list[dict] = []
+    count = _write_dataset_audio(
+        dataset,
+        dest,
+        "rir",
+        None,
+        io_workers,
+        index_entries=index_entries,
+        source_key="mit_rirs",
+    )
     count = _finalize_bootstrap_audio_count(dest, description="MIT RIR dataset", expected_audio_files=count)
+    _write_bootstrap_index(dest, index_entries)
     _write_bootstrap_manifest(dest, description="MIT RIR dataset", expected_audio_files=count)
     log.info("  Saved %d RIR files", count)
 
@@ -1965,7 +2475,7 @@ def _download_audioset_subset(dest: Path, limit: int | None = 300, io_workers: i
     if _bootstrap_audio_dir_verified(dest, description="AudioSet subset"):
         return
 
-    dest.mkdir(parents=True, exist_ok=True)
+    _reset_dir(dest)
     dataset = load_dataset(
         "agkphysics/AudioSet",
         "unbalanced",
@@ -1973,8 +2483,18 @@ def _download_audioset_subset(dest: Path, limit: int | None = 300, io_workers: i
         streaming=True,
         trust_remote_code=True,
     )
-    count = _write_dataset_audio(dataset, dest, "audioset", limit, io_workers)
+    index_entries: list[dict] = []
+    count = _write_dataset_audio(
+        dataset,
+        dest,
+        "audioset",
+        limit,
+        io_workers,
+        index_entries=index_entries,
+        source_key="audioset_16k",
+    )
     count = _finalize_bootstrap_audio_count(dest, description="AudioSet subset", expected_audio_files=count)
+    _write_bootstrap_index(dest, index_entries)
     _write_bootstrap_manifest(dest, description="AudioSet subset", expected_audio_files=count, metadata={"limit": limit})
     log.info("  Saved %d AudioSet clips", count)
 
@@ -1985,9 +2505,10 @@ def _download_fma_subset(dest: Path, limit: int | None = 200, io_workers: int = 
     if _bootstrap_audio_dir_verified(dest, description="FMA subset"):
         return
 
-    dest.mkdir(parents=True, exist_ok=True)
+    _reset_dir(dest)
 
     count = 0
+    index_entries: list[dict] = []
 
     try:
         dataset = load_dataset(
@@ -1997,7 +2518,15 @@ def _download_fma_subset(dest: Path, limit: int | None = 200, io_workers: int = 
             streaming=True,
             trust_remote_code=True,
         )
-        count = _write_dataset_audio(dataset, dest, "fma", limit, io_workers)
+        count = _write_dataset_audio(
+            dataset,
+            dest,
+            "fma",
+            limit,
+            io_workers,
+            index_entries=index_entries,
+            source_key="fma_16k",
+        )
     except Exception as exc:
         log.warning("  Streaming FMA download failed, retrying non-streaming subset: %s", exc)
         dataset = load_dataset(
@@ -2007,9 +2536,19 @@ def _download_fma_subset(dest: Path, limit: int | None = 200, io_workers: int = 
             streaming=False,
             trust_remote_code=True,
         )
-        count = _write_dataset_audio(dataset, dest, "fma", limit, io_workers)
+        index_entries.clear()
+        count = _write_dataset_audio(
+            dataset,
+            dest,
+            "fma",
+            limit,
+            io_workers,
+            index_entries=index_entries,
+            source_key="fma_16k",
+        )
 
     count = _finalize_bootstrap_audio_count(dest, description="FMA subset", expected_audio_files=count)
+    _write_bootstrap_index(dest, index_entries)
     _write_bootstrap_manifest(dest, description="FMA subset", expected_audio_files=count, metadata={"limit": limit})
     log.info("  Saved %d FMA clips", count)
 
@@ -2104,9 +2643,25 @@ def _negative_feature_names(cfg: dict) -> list[str]:
     return ["speech", "dinner_party", "no_speech", "dinner_party_eval"]
 
 
+def _configured_background_audio_paths(cfg: dict) -> list[Path]:
+    return [
+        _resolve_path(str(path))
+        for path in cfg.get("background_audio_paths", []) or []
+        if str(path).strip()
+    ]
+
+
+def _default_background_audio_paths() -> list[Path]:
+    return [DATA_DIR / "fma_16k", DATA_DIR / "audioset_16k"]
+
+
+def _include_default_background_subsets(cfg: dict) -> bool:
+    return bool(cfg.get("include_default_background_subsets", False))
+
+
 def _base_background_audio_paths(cfg: dict) -> list[str]:
-    defaults = [DATA_DIR / "fma_16k", DATA_DIR / "audioset_16k"]
-    configured = [_resolve_path(str(path)) for path in cfg.get("background_audio_paths", []) or [] if str(path).strip()]
+    defaults = _default_background_audio_paths() if _include_default_background_subsets(cfg) else []
+    configured = _configured_background_audio_paths(cfg)
 
     resolved: list[str] = []
     seen: set[str] = set()
@@ -2144,19 +2699,23 @@ def step_download_assets() -> bool:
     audioset_max_clips = _resolve_clip_limit(asset_cfg.get("audioset_max_clips"), 300)
     fma_max_clips = _resolve_clip_limit(asset_cfg.get("fma_max_clips"), 200)
     io_workers = _resolve_io_workers(asset_cfg)
+    configured_backgrounds = {str(path) for path in _configured_background_audio_paths(cfg)}
+    use_default_backgrounds = _include_default_background_subsets(cfg)
 
     try:
         _download_mit_rirs(DATA_DIR / "mit_rirs", io_workers=io_workers)
-        _download_audioset_subset(
-            DATA_DIR / "audioset_16k",
-            limit=audioset_max_clips,
-            io_workers=io_workers,
-        )
-        _download_fma_subset(
-            DATA_DIR / "fma_16k",
-            limit=fma_max_clips,
-            io_workers=io_workers,
-        )
+        if use_default_backgrounds or str(DATA_DIR / "audioset_16k") in configured_backgrounds:
+            _download_audioset_subset(
+                DATA_DIR / "audioset_16k",
+                limit=audioset_max_clips,
+                io_workers=io_workers,
+            )
+        if use_default_backgrounds or str(DATA_DIR / "fma_16k") in configured_backgrounds:
+            _download_fma_subset(
+                DATA_DIR / "fma_16k",
+                limit=fma_max_clips,
+                io_workers=io_workers,
+            )
         _bootstrap_background_audio_datasets(cfg)
 
         neg_root = _negative_datasets_dir(cfg)
@@ -2217,10 +2776,11 @@ def step_prepare_positives() -> bool:
             if total_files == 0:
                 log.error("  Positive source directories exist, but no audio files were found")
                 return False
-            if _positive_segmentation_enabled(cfg):
-                _prepare_segmented_positive_splits(cfg, source_dirs)
-                return True
-            if len(source_dirs) == 1:
+            if _task(cfg) == "vad":
+                _prepare_positive_splits(cfg, source_dirs)
+                if _positive_segmentation_enabled(cfg):
+                    _prepare_segmented_positive_splits(cfg, source_dirs)
+            elif len(source_dirs) == 1:
                 log.info("  Using %d positive clips from %s", total_files, source_dirs[0])
             else:
                 _stage_positive_sources(cfg, source_dirs)
@@ -2249,6 +2809,87 @@ def _positive_source(cfg: dict) -> tuple[Path, str]:
         return _generated_samples_dir(cfg), "*.wav"
 
     raise ValueError("No positive audio source is available")
+
+
+def _vad_positive_split_dirs(cfg: dict) -> dict[str, Path]:
+    source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
+    if not source_dirs:
+        raise ValueError("No positive audio source is available")
+    if _positive_segmentation_enabled(cfg):
+        return _prepare_segmented_positive_splits(cfg, source_dirs)
+    return _prepare_positive_splits(cfg, source_dirs)
+
+
+def _build_positive_augmenter(cfg: dict, background_paths: list[str], *, eval_mode: bool = False):
+    from microwakeword.audio.augmentation import Augmentation
+
+    aug_cfg = cfg.get("augmentation", {}) or {}
+    apply_to_eval = bool(aug_cfg.get("apply_to_eval", False))
+    use_train_augmentation = not eval_mode or apply_to_eval
+
+    augmentation_probabilities = (
+        _resolve_augmentation_probabilities(aug_cfg.get("probabilities", {}))
+        if use_train_augmentation
+        else {}
+    )
+    impulse_paths = [str(DATA_DIR / "mit_rirs")] if use_train_augmentation else []
+    runtime_background_paths = background_paths if use_train_augmentation else []
+    background_min_snr_db = int(aug_cfg.get("background_min_snr_db", -5)) if use_train_augmentation else 0
+    background_max_snr_db = int(aug_cfg.get("background_max_snr_db", 10)) if use_train_augmentation else 0
+    min_jitter_s = float(aug_cfg.get("min_jitter_s", 0.195)) if use_train_augmentation else 0.0
+    max_jitter_s = float(aug_cfg.get("max_jitter_s", 0.205)) if use_train_augmentation else 0.0
+
+    return Augmentation(
+        augmentation_duration_s=float(aug_cfg.get("duration_s", 3.2)),
+        augmentation_probabilities=augmentation_probabilities,
+        impulse_paths=impulse_paths,
+        background_paths=runtime_background_paths,
+        background_min_snr_db=background_min_snr_db,
+        background_max_snr_db=background_max_snr_db,
+        min_jitter_s=min_jitter_s,
+        max_jitter_s=max_jitter_s,
+    )
+
+
+def _positive_feature_manifest(cfg: dict, split_dirs: dict[str, Path], background_paths: list[str]) -> dict:
+    aug_cfg = cfg.get("augmentation", {}) or {}
+    return {
+        "split_sources": _source_dirs_state(list(split_dirs.values())),
+        "background_sources": _source_dirs_state([Path(path) for path in background_paths]),
+        "augmentation_duration_s": float(aug_cfg.get("duration_s", 3.2)),
+        "augmentation_probabilities": _resolve_augmentation_probabilities(aug_cfg.get("probabilities", {})),
+        "background_min_snr_db": int(aug_cfg.get("background_min_snr_db", -5)),
+        "background_max_snr_db": int(aug_cfg.get("background_max_snr_db", 10)),
+        "min_jitter_s": float(aug_cfg.get("min_jitter_s", 0.195)),
+        "max_jitter_s": float(aug_cfg.get("max_jitter_s", 0.205)),
+        "apply_to_eval": bool(aug_cfg.get("apply_to_eval", False)),
+        "remove_silence": bool(cfg.get("remove_silence", False)),
+    }
+
+
+def _build_generated_background_augmenter(cfg: dict, neg_cfg: dict, *, eval_mode: bool = False):
+    from microwakeword.audio.augmentation import Augmentation
+
+    apply_to_eval = bool(neg_cfg.get("apply_to_eval", False))
+    use_train_augmentation = not eval_mode or apply_to_eval
+    impulse_paths: list[str] = []
+    if use_train_augmentation and bool(neg_cfg.get("use_rirs", False)) and _dir_has_entries(DATA_DIR / "mit_rirs"):
+        impulse_paths = [str(DATA_DIR / "mit_rirs")]
+
+    return Augmentation(
+        augmentation_duration_s=float(neg_cfg.get("duration_s", cfg.get("augmentation", {}).get("duration_s", 3.2))),
+        augmentation_probabilities=(
+            _resolve_augmentation_probabilities(neg_cfg.get("probabilities", {}))
+            if use_train_augmentation
+            else {}
+        ),
+        impulse_paths=impulse_paths,
+        background_paths=[],
+        background_min_snr_db=0,
+        background_max_snr_db=0,
+        min_jitter_s=0.0,
+        max_jitter_s=0.0,
+    )
 
 
 def _clip_entry_path(entry: dict) -> str:
@@ -2289,15 +2930,12 @@ def step_audit_validation() -> bool:
 
     split_paths: dict[str, list[str]] = {}
     split_hashes: dict[str, set[str]] = {}
-    if _positive_segmentation_enabled(cfg):
-        split_dirs = _segmented_positive_split_dirs(cfg)
-        if not all(_dir_has_entries(path) for path in split_dirs.values()):
-            try:
-                source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
-                _prepare_segmented_positive_splits(cfg, source_dirs)
-            except Exception as exc:
-                log.error("  Failed to prepare segmented positive splits for audit: %s", exc)
-                return False
+    if _task(cfg) == "vad":
+        try:
+            split_dirs = _vad_positive_split_dirs(cfg)
+        except Exception as exc:
+            log.error("  Failed to prepare grouped positive splits for audit: %s", exc)
+            return False
 
         for split_name, directory in split_dirs.items():
             paths = [str(path) for path in _safe_iter_audio_files(directory)]
@@ -2479,20 +3117,42 @@ def step_generate_positive_features() -> bool:
 
     cfg = _load_config()
     features_dir = _positive_features_dir(cfg)
+    manifest_path = _positive_feature_manifest_path(cfg)
     ready, missing_splits = _positive_feature_pack_status(features_dir)
-    if ready:
+    split_source_dirs: dict[str, Path] | None = None
+    feature_manifest: dict | None = None
+    if _task(cfg) == "vad":
+        try:
+            split_source_dirs = _vad_positive_split_dirs(cfg)
+        except Exception as exc:
+            log.error("  Positive feature preparation failed before generation: %s", exc)
+            return False
+
+        background_paths = _resolve_background_audio_paths(cfg)
+        feature_manifest = _positive_feature_manifest(cfg, split_source_dirs, background_paths)
+        if ready and manifest_path.exists():
+            try:
+                current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                current_manifest = None
+            if current_manifest == feature_manifest:
+                log.info("  Positive features already present at %s", features_dir)
+                return True
+    elif ready:
         log.info("  Positive features already present at %s", features_dir)
         return True
     if features_dir.exists() and any(features_dir.iterdir()):
-        log.warning(
-            "  Existing positive feature pack at %s is incomplete; missing mmap data for: %s. Rebuilding.",
-            features_dir,
-            ", ".join(missing_splits),
-        )
+        if not ready:
+            log.warning(
+                "  Existing positive feature pack at %s is incomplete; missing mmap data for: %s. Rebuilding.",
+                features_dir,
+                ", ".join(missing_splits),
+            )
+        else:
+            log.warning("  Existing positive feature pack at %s is stale for the current data/augmentation state. Rebuilding.", features_dir)
         shutil.rmtree(features_dir)
 
     from mmap_ninja.ragged import RaggedMmap
-    from microwakeword.audio.augmentation import Augmentation
     from microwakeword.audio.clips import Clips
     from microwakeword.audio.spectrograms import SpectrogramGeneration
 
@@ -2502,38 +3162,23 @@ def step_generate_positive_features() -> bool:
     background_paths = _resolve_background_audio_paths(cfg)
     if not background_paths:
         log.warning("  No background audio directories were found for augmentation.")
-    augmenter = Augmentation(
-        augmentation_duration_s=float(aug_cfg.get("duration_s", 3.2)),
-        augmentation_probabilities=_resolve_augmentation_probabilities(
-            aug_cfg.get("probabilities", {})
-        ),
-        impulse_paths=[str(DATA_DIR / "mit_rirs")],
-        background_paths=background_paths,
-        background_min_snr_db=int(aug_cfg.get("background_min_snr_db", -5)),
-        background_max_snr_db=int(aug_cfg.get("background_max_snr_db", 10)),
-        min_jitter_s=float(aug_cfg.get("min_jitter_s", 0.195)),
-        max_jitter_s=float(aug_cfg.get("max_jitter_s", 0.205)),
-    )
+    train_augmenter = _build_positive_augmenter(cfg, background_paths, eval_mode=False)
+    eval_augmenter = _build_positive_augmenter(cfg, background_paths, eval_mode=True)
 
-    if _positive_segmentation_enabled(cfg):
-        source_dirs = [path for path in _resolve_positive_sources(cfg) if path.exists()]
-        split_source_dirs = _prepare_segmented_positive_splits(cfg, source_dirs)
+    if _task(cfg) == "vad":
+        split_source_dirs = split_source_dirs or _vad_positive_split_dirs(cfg)
         split_plan = (
-            ("training", split_source_dirs["train"], 1, 10),
+            ("training", split_source_dirs["train"], 2, 10),
             ("validation", split_source_dirs["validation"], 1, 10),
             ("testing", split_source_dirs["test"], 1, 1),
         )
     else:
         positive_dir, file_pattern = _positive_source(cfg)
-        clips = Clips(
-            input_directory=str(positive_dir),
-            file_pattern=file_pattern,
-            max_clip_duration_s=None,
-            remove_silence=bool(cfg.get("remove_silence", False)),
-            random_split_seed=int(cfg.get("random_split_seed", 10)),
-            split_count=float(cfg.get("split_count", 0.1)),
+        split_plan = (
+            ("training", positive_dir, 2, 10, "train"),
+            ("validation", positive_dir, 1, 10, "validation"),
+            ("testing", positive_dir, 1, 1, "test"),
         )
-        split_plan = None
 
     for split in ("training", "validation", "testing"):
         out_dir = features_dir / split
@@ -2543,25 +3188,25 @@ def step_generate_positive_features() -> bool:
         slide_frames = 10
         clip_split = "train"
         split_dir = None
+        augmenter = train_augmenter
         if split == "validation":
             repetition = 1
-            clip_split = "validation"
+            augmenter = eval_augmenter
         elif split == "testing":
             repetition = 1
             slide_frames = 1
-            clip_split = "test"
+            augmenter = eval_augmenter
 
-        if split_plan is not None:
+        if _task(cfg) == "vad":
             for split_name_key, split_source_dir, split_repetition, split_slide_frames in split_plan:
                 if split_name_key == split:
                     split_dir = split_source_dir
                     repetition = split_repetition
                     slide_frames = split_slide_frames
-                    clip_split = "train"
                     break
 
             if split_dir is None:
-                raise ValueError(f"Missing segmented positive directory for split {split}")
+                raise ValueError(f"Missing grouped positive directory for split {split}")
 
             clips = Clips(
                 input_directory=str(split_dir),
@@ -2569,10 +3214,28 @@ def step_generate_positive_features() -> bool:
                 max_clip_duration_s=None,
                 remove_silence=bool(cfg.get("remove_silence", False)),
                 random_split_seed=int(cfg.get("random_split_seed", 10)),
-                # Upstream Clips requires a positive holdout size, even when we already
-                # split source files ourselves. Using an integer of 1 keeps the
-                # secondary split negligible while avoiding leakage across source files.
                 split_count=1,
+            )
+            clip_split = "train"
+        else:
+            for split_name_key, split_source_dir, split_repetition, split_slide_frames, split_clip_split in split_plan:
+                if split_name_key == split:
+                    split_dir = split_source_dir
+                    repetition = split_repetition
+                    slide_frames = split_slide_frames
+                    clip_split = split_clip_split
+                    break
+
+            if split_dir is None:
+                raise ValueError(f"Missing positive source directory for split {split}")
+
+            clips = Clips(
+                input_directory=str(split_dir),
+                file_pattern=file_pattern,
+                max_clip_duration_s=None,
+                remove_silence=bool(cfg.get("remove_silence", False)),
+                random_split_seed=int(cfg.get("random_split_seed", 10)),
+                split_count=float(cfg.get("split_count", 0.1)),
             )
 
         spectrograms = SpectrogramGeneration(
@@ -2592,6 +3255,8 @@ def step_generate_positive_features() -> bool:
             verbose=True,
         )
 
+    if feature_manifest is not None:
+        manifest_path.write_text(json.dumps(feature_manifest, indent=2) + "\n", encoding="utf-8")
     log.info("  Generated positive feature datasets at %s", features_dir)
     return True
 
@@ -2616,7 +3281,8 @@ def step_generate_background_negative_features() -> bool:
     manifest_path = _generated_background_negative_manifest_path(cfg)
 
     feature_manifest = {
-        "sources": [str(path) for path in source_dirs],
+        "sources": _source_dirs_state(source_dirs),
+        "staged_sources": [_source_dir_state(staged_dir)],
         "duration_s": float(neg_cfg.get("duration_s", cfg.get("augmentation", {}).get("duration_s", 3.2))),
         "training_repeat": int(neg_cfg.get("training_repeat", 1)),
         "training_slide_frames": int(neg_cfg.get("training_slide_frames", 5)),
@@ -2625,6 +3291,7 @@ def step_generate_background_negative_features() -> bool:
         "split_count": float(cfg.get("split_count", 0.1)),
         "probabilities": dict(neg_cfg.get("probabilities", {})),
         "use_rirs": bool(neg_cfg.get("use_rirs", False)),
+        "apply_to_eval": bool(neg_cfg.get("apply_to_eval", False)),
     }
 
     if _background_negative_pack_ready(features_dir) and manifest_path.exists():
@@ -2641,7 +3308,6 @@ def step_generate_background_negative_features() -> bool:
     features_dir.mkdir(parents=True, exist_ok=True)
 
     from mmap_ninja.ragged import RaggedMmap
-    from microwakeword.audio.augmentation import Augmentation
     from microwakeword.audio.clips import Clips
     from microwakeword.audio.spectrograms import SpectrogramGeneration
 
@@ -2654,20 +3320,8 @@ def step_generate_background_negative_features() -> bool:
         split_count=float(cfg.get("split_count", 0.1)),
     )
 
-    impulse_paths: list[str] = []
-    if bool(neg_cfg.get("use_rirs", False)) and _dir_has_entries(DATA_DIR / "mit_rirs"):
-        impulse_paths = [str(DATA_DIR / "mit_rirs")]
-
-    augmenter = Augmentation(
-        augmentation_duration_s=float(neg_cfg.get("duration_s", cfg.get("augmentation", {}).get("duration_s", 3.2))),
-        augmentation_probabilities=_resolve_augmentation_probabilities(neg_cfg.get("probabilities", {})),
-        impulse_paths=impulse_paths,
-        background_paths=[],
-        background_min_snr_db=0,
-        background_max_snr_db=0,
-        min_jitter_s=0.0,
-        max_jitter_s=0.0,
-    )
+    train_augmenter = _build_generated_background_augmenter(cfg, neg_cfg, eval_mode=False)
+    eval_augmenter = _build_generated_background_augmenter(cfg, neg_cfg, eval_mode=True)
 
     split_plan = (
         ("training", "train", int(neg_cfg.get("training_repeat", 1)), int(neg_cfg.get("training_slide_frames", 5))),
@@ -2678,6 +3332,8 @@ def step_generate_background_negative_features() -> bool:
     for split_name, clip_split, repetition, slide_frames in split_plan:
         out_dir = features_dir / split_name
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        augmenter = train_augmenter if split_name == "training" else eval_augmenter
 
         spectrograms = SpectrogramGeneration(
             clips=clips,
@@ -2783,6 +3439,8 @@ def step_train() -> bool:
         return False
 
     cfg = _load_config()
+    training_config: Path | None = None
+    attempts: list[dict] = []
     try:
         neg_root = _negative_datasets_dir(cfg)
         neg_archive_root = _negative_feature_archives_dir(cfg)
@@ -2856,8 +3514,17 @@ def step_train() -> bool:
         if train_env.get("XLA_FLAGS"):
             log.info("  XLA_FLAGS=%s", train_env["XLA_FLAGS"])
 
+        returncode, captured_lines = _run_with_live_output(cmd, env=train_env)
+        attempts.append(
+            {
+                "device": primary_device,
+                "returncode": returncode,
+                "captured_lines": captured_lines,
+            }
+        )
         try:
-            _run(cmd, env=train_env)
+            if returncode != 0:
+                raise subprocess.CalledProcessError(returncode, cmd)
         except subprocess.CalledProcessError as exc:
             allow_cpu_fallback = bool(runtime.get("allow_cpu_fallback", True))
             if primary_device != "cpu" and allow_cpu_fallback:
@@ -2867,11 +3534,34 @@ def step_train() -> bool:
                 )
                 cpu_env, _ = _build_training_env(cfg, force_device="cpu")
                 log.info("  CPU fallback sets CUDA_VISIBLE_DEVICES=%s", cpu_env["CUDA_VISIBLE_DEVICES"])
-                _run(cmd, env=cpu_env)
+                cpu_returncode, cpu_captured_lines = _run_with_live_output(cmd, env=cpu_env)
+                attempts.append(
+                    {
+                        "device": "cpu",
+                        "returncode": cpu_returncode,
+                        "captured_lines": cpu_captured_lines,
+                    }
+                )
+                if cpu_returncode != 0:
+                    raise subprocess.CalledProcessError(cpu_returncode, cmd)
             else:
                 raise
+        _write_training_result_summary(
+            cfg,
+            training_config_path=training_config,
+            status="success",
+            attempts=attempts,
+        )
         return True
     except subprocess.CalledProcessError as exc:
+        if training_config is not None:
+            _write_training_result_summary(
+                cfg,
+                training_config_path=training_config,
+                status="failed",
+                attempts=attempts,
+                error=f"exit code {exc.returncode}",
+            )
         log.error("  Training failed with exit code %d", exc.returncode)
         return False
     except ValueError as exc:

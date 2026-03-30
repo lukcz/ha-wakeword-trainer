@@ -47,6 +47,7 @@ bootstrap_speech_datasets:
     output_dir: "data/mls_polish"
     max_clips: null
 
+include_default_background_subsets: true
 background_audio_paths:
   - "data/audioset_16k"
   - "data/fma_16k"
